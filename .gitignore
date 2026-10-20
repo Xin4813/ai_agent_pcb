@@ -1,0 +1,14 @@
+# 密钥与本地配置（千万别提交！）
+config.toml
+.env
+*.key
+
+# Python
+venv/
+__pycache__/
+*.pyc
+*.egg-info/
+
+# 系统/编辑器垃圾
+.DS_Store
+Thumbs.db
