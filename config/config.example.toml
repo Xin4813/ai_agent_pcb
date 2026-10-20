@@ -25,7 +25,8 @@ max_retries = 3
 keep_history = true
 
 [kicad]
-# KiCad 8 安装目录（Windows 默认如下），后续脚本接口要用
-install_dir = "C:/Program Files/KiCad/8.0"
+# KiCad 8 安装目录（你的实际路径，见下）。注意 TOML 里用正斜杠 /，
+# 不要直接贴 Windows 的反斜杠 \，否则配置文件会解析失败。
+install_dir = "C:/Users/Gray/AppData/Local/Programs/KiCad/8.0"
 # 生成的 .kicad_sch 输出目录
 sch_output_dir = "examples/output/schematic"
