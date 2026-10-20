@@ -1,0 +1,31 @@
+# ============================================================
+# LLM / Agent 配置模板
+# 用法：把本文件复制为 config/config.toml，再填入真实密钥。
+#   cp config/config.example.toml config/config.toml
+# config/config.toml 已被 .gitignore 忽略，绝不会被提交到仓库。
+# ============================================================
+
+[llm]
+# OpenAI 兼容接口地址（到 /v1 为止，不要带 /chat/completions）
+# 课程统一密钥/学校算力平台的备用通道地址，按课程群公告填这里
+base_url = "https://api.example.com/v1"
+# 你的 API Key（机密！只放本地，永不提交）
+api_key = "sk-在这里填你的密钥"
+# 模型名，按课程/平台提供的填
+model = "gpt-4o-mini"
+# 结构化输出建议低温，减少胡编
+temperature = 0.2
+
+[agent]
+# BOM / 网表 / 原理图的输出目录
+output_dir = "examples/output"
+# JSON 校验失败时，让模型自我纠正的最大重试次数
+max_retries = 3
+# 每次生成的结果是否加时间戳留档（方便写失败案例分析）
+keep_history = true
+
+[kicad]
+# KiCad 8 安装目录（Windows 默认如下），后续脚本接口要用
+install_dir = "C:/Program Files/KiCad/8.0"
+# 生成的 .kicad_sch 输出目录
+sch_output_dir = "examples/output/schematic"

@@ -11,7 +11,10 @@
 - 一个 OpenAI 兼容的 LLM API（密钥放 config.toml，不提交）
 
 ## 3. 安装步骤
-（待补充：clone / 建 venv / pip install -r requirements.txt / 配置 config.toml）
+1. 克隆仓库：`git clone https://github.com/Xin4813/ai_agent_pcb.git`
+2. 创建并激活虚拟环境：`python -m venv venv` → `venv\Scripts\activate`（Windows）
+3. 安装依赖：`pip install -r requirements.txt`
+4. 配置密钥：复制 `config/config.example.toml` 为 `config/config.toml`，填入你的 API Key（该文件已被 .gitignore 忽略，不会提交）
 
 ## 4. 运行命令
 （待补充：python -m src.agent "帮我设计一块 Arduino 最小系统板"）
