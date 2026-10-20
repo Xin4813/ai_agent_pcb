@@ -1,0 +1,195 @@
+ERC 报告 (2026-10-21T00:55:22+0800, UTF8 编码)
+
+***** 图纸 /
+[lib_symbol_issues]: 当前配置不包含库 ''
+    ; warning
+    @(700.0000 mm, 350.0000 mm): 符号 R2 [R]
+[endpoint_off_grid]: 符号引脚或连线没有与栅格对齐
+    ; warning
+    @(700.0000 mm, 96.1900 mm): Symbol C1 引脚 1 [无源, 图线]
+[endpoint_off_grid]: 符号引脚或连线没有与栅格对齐
+    ; warning
+    @(400.0000 mm, 346.1900 mm): Symbol R1 引脚 1 [无源, 图线]
+[endpoint_off_grid]: 符号引脚或连线没有与栅格对齐
+    ; warning
+    @(403.8100 mm, 100.0000 mm): 水平线, 长度 25.0000 mm
+[endpoint_off_grid]: 符号引脚或连线没有与栅格对齐
+    ; warning
+    @(700.0000 mm, 353.8100 mm): 垂直线, 长度 25.0000 mm
+[endpoint_off_grid]: 符号引脚或连线没有与栅格对齐
+    ; warning
+    @(700.0000 mm, 346.1900 mm): 垂直线, 长度 25.0000 mm
+[endpoint_off_grid]: 符号引脚或连线没有与栅格对齐
+    ; warning
+    @(700.0000 mm, 346.1900 mm): 垂直线, 长度 25.0000 mm
+[endpoint_off_grid]: 符号引脚或连线没有与栅格对齐
+    ; warning
+    @(700.0000 mm, 346.1900 mm): Symbol R2 引脚 1 [无源, 图线]
+[lib_symbol_issues]: 当前配置不包含库 ''
+    ; warning
+    @(700.0000 mm, 100.0000 mm): 符号 C1 [C]
+[endpoint_off_grid]: 符号引脚或连线没有与栅格对齐
+    ; warning
+    @(700.0000 mm, 96.1900 mm): 垂直线, 长度 25.0000 mm
+[endpoint_off_grid]: 符号引脚或连线没有与栅格对齐
+    ; warning
+    @(700.0000 mm, 103.8100 mm): 垂直线, 长度 25.0000 mm
+[endpoint_off_grid]: 符号引脚或连线没有与栅格对齐
+    ; warning
+    @(396.1900 mm, 100.0000 mm): 水平线, 长度 25.0000 mm
+[endpoint_off_grid]: 符号引脚或连线没有与栅格对齐
+    ; warning
+    @(396.1900 mm, 100.0000 mm): Symbol Y1 引脚 1 [1, 无源, 图线]
+[lib_symbol_issues]: 当前配置不包含库 ''
+    ; warning
+    @(100.0000 mm, 350.0000 mm): 符号 C3 [C]
+[endpoint_off_grid]: 符号引脚或连线没有与栅格对齐
+    ; warning
+    @(100.0000 mm, 353.8100 mm): 垂直线, 长度 25.0000 mm
+[pin_not_connected]: 引脚未连接
+    ; error
+    @(115.2400 mm, 107.6200 mm): Symbol U1 引脚 1 [~{RESET}/PC6, 双向, 图线]
+[pin_not_connected]: 引脚未连接
+    ; error
+    @(115.2400 mm, 127.9400 mm): Symbol U1 引脚 12 [PD6, 双向, 图线]
+[pin_not_connected]: 引脚未连接
+    ; error
+    @(115.2400 mm, 130.4800 mm): Symbol U1 引脚 13 [PD7, 双向, 图线]
+[pin_not_connected]: 引脚未连接
+    ; error
+    @(115.2400 mm, 97.4600 mm): Symbol U1 引脚 25 [PC2, 双向, 图线]
+[pin_not_connected]: 引脚未连接
+    ; error
+    @(115.2400 mm, 100.0000 mm): Symbol U1 引脚 26 [PC3, 双向, 图线]
+[pin_not_connected]: 引脚未连接
+    ; error
+    @(115.2400 mm, 117.7800 mm): Symbol U1 引脚 4 [PD2, 双向, 图线]
+[pin_not_connected]: 引脚未连接
+    ; error
+    @(115.2400 mm, 120.3200 mm): Symbol U1 引脚 5 [PD3, 双向, 图线]
+[pin_not_connected]: 引脚未连接
+    ; error
+    @(115.2400 mm, 122.8600 mm): Symbol U1 引脚 6 [PD4, 双向, 图线]
+[pin_not_connected]: 引脚未连接
+    ; error
+    @(115.2400 mm, 125.4000 mm): Symbol U1 引脚 11 [PD5, 双向, 图线]
+[power_pin_not_driven]: 输入电源引脚不受任何输出电源引脚驱动
+    ; error
+    @(100.0000 mm, 138.1000 mm): Symbol U1 引脚 8 [GND, 电源输入, 图线]
+[endpoint_off_grid]: 符号引脚或连线没有与栅格对齐
+    ; warning
+    @(100.0000 mm, 138.1000 mm): 垂直线, 长度 25.0000 mm
+[endpoint_off_grid]: 符号引脚或连线没有与栅格对齐
+    ; warning
+    @(102.5400 mm, 138.1000 mm): 垂直线, 长度 25.0000 mm
+[lib_symbol_issues]: 当前配置不包含库 ''
+    ; warning
+    @(400.0000 mm, 350.0000 mm): 符号 R1 [R]
+[lib_symbol_issues]: 当前配置不包含库 ''
+    ; warning
+    @(400.0000 mm, 100.0000 mm): 符号 Y1 [Crystal]
+[endpoint_off_grid]: 符号引脚或连线没有与栅格对齐
+    ; warning
+    @(400.0000 mm, 353.8100 mm): 垂直线, 长度 25.0000 mm
+[endpoint_off_grid]: 符号引脚或连线没有与栅格对齐
+    ; warning
+    @(400.0000 mm, 346.1900 mm): 垂直线, 长度 25.0000 mm
+[endpoint_off_grid]: 符号引脚或连线没有与栅格对齐
+    ; warning
+    @(100.0000 mm, 346.1900 mm): 垂直线, 长度 25.0000 mm
+[endpoint_off_grid]: 符号引脚或连线没有与栅格对齐
+    ; warning
+    @(100.0000 mm, 346.1900 mm): Symbol C3 引脚 1 [无源, 图线]
+[pin_not_connected]: 引脚未连接
+    ; error
+    @(115.2400 mm, 84.7600 mm): Symbol U1 引脚 9 [XTAL1/PB6, 双向, 图线]
+[pin_not_connected]: 引脚未连接
+    ; error
+    @(115.2400 mm, 87.3000 mm): Symbol U1 引脚 10 [XTAL2/PB7, 双向, 图线]
+[pin_not_connected]: 引脚未连接
+    ; error
+    @(115.2400 mm, 82.2200 mm): Symbol U1 引脚 19 [PB5, 双向, 图线]
+[endpoint_off_grid]: 符号引脚或连线没有与栅格对齐
+    ; warning
+    @(115.2400 mm, 92.3800 mm): 水平线, 长度 25.0000 mm
+[pin_not_connected]: 引脚未连接
+    ; error
+    @(115.2400 mm, 69.5200 mm): Symbol U1 引脚 14 [PB0, 双向, 图线]
+[pin_not_connected]: 引脚未连接
+    ; error
+    @(115.2400 mm, 72.0600 mm): Symbol U1 引脚 15 [PB1, 双向, 图线]
+[pin_not_connected]: 引脚未连接
+    ; error
+    @(115.2400 mm, 74.6000 mm): Symbol U1 引脚 16 [PB2, 双向, 图线]
+[pin_not_connected]: 引脚未连接
+    ; error
+    @(115.2400 mm, 77.1400 mm): Symbol U1 引脚 17 [PB3, 双向, 图线]
+[pin_not_connected]: 引脚未连接
+    ; error
+    @(115.2400 mm, 79.6800 mm): Symbol U1 引脚 18 [PB4, 双向, 图线]
+[pin_not_connected]: 引脚未连接
+    ; error
+    @(102.5400 mm, 61.9000 mm): Symbol U1 引脚 20 [AVCC, 电源输入, 图线]
+[pin_not_connected]: 引脚未连接
+    ; error
+    @(84.7600 mm, 69.5200 mm): Symbol U1 引脚 21 [AREF, 无源, 图线]
+[power_pin_not_driven]: 输入电源引脚不受任何输出电源引脚驱动
+    ; error
+    @(100.0000 mm, 61.9000 mm): Symbol U1 引脚 7 [VCC, 电源输入, 图线]
+[endpoint_off_grid]: 符号引脚或连线没有与栅格对齐
+    ; warning
+    @(100.0000 mm, 61.9000 mm): 垂直线, 长度 25.0000 mm
+[endpoint_off_grid]: 符号引脚或连线没有与栅格对齐
+    ; warning
+    @(100.0000 mm, 61.9000 mm): 垂直线, 长度 25.0000 mm
+[pin_not_connected]: 引脚未连接
+    ; error
+    @(115.2400 mm, 94.9200 mm): Symbol U1 引脚 24 [PC1, 双向, 图线]
+[pin_not_connected]: 引脚未连接
+    ; error
+    @(115.2400 mm, 102.5400 mm): Symbol U1 引脚 27 [PC4, 双向, 图线]
+[pin_not_connected]: 引脚未连接
+    ; error
+    @(115.2400 mm, 105.0800 mm): Symbol U1 引脚 28 [PC5, 双向, 图线]
+[lib_symbol_issues]: 当前配置不包含库 ''
+    ; warning
+    @(100.0000 mm, 100.0000 mm): 符号 U1 [ATmega328P-P]
+[endpoint_off_grid]: 符号引脚或连线没有与栅格对齐
+    ; warning
+    @(115.2400 mm, 112.7000 mm): 水平线, 长度 25.0000 mm
+[endpoint_off_grid]: 符号引脚或连线没有与栅格对齐
+    ; warning
+    @(115.2400 mm, 115.2400 mm): 水平线, 长度 25.0000 mm
+[endpoint_off_grid]: 符号引脚或连线没有与栅格对齐
+    ; warning
+    @(115.2400 mm, 107.6200 mm): Symbol U1 引脚 1 [~{RESET}/PC6, 双向, 图线]
+[multiple_net_names]: GND 和 LED 都连接到同一项上; 将使用 GND 作为网表中的网络名称
+    ; warning
+    @(100.0000 mm, 86.9000 mm): 标签 'GND'
+    @(1021.1900 mm, 350.0000 mm): 标签 'LED'
+[lib_symbol_issues]: 当前配置不包含库 ''
+    ; warning
+    @(1000.0000 mm, 350.0000 mm): 符号 D1 [LED]
+[endpoint_off_grid]: 符号引脚或连线没有与栅格对齐
+    ; warning
+    @(1003.8100 mm, 350.0000 mm): 水平线, 长度 25.0000 mm
+[endpoint_off_grid]: 符号引脚或连线没有与栅格对齐
+    ; warning
+    @(996.1900 mm, 350.0000 mm): Symbol D1 引脚 1 [K, 无源, 图线]
+[lib_symbol_issues]: 当前配置不包含库 ''
+    ; warning
+    @(1000.0000 mm, 100.0000 mm): 符号 C2 [C]
+[endpoint_off_grid]: 符号引脚或连线没有与栅格对齐
+    ; warning
+    @(1000.0000 mm, 96.1900 mm): 垂直线, 长度 25.0000 mm
+[endpoint_off_grid]: 符号引脚或连线没有与栅格对齐
+    ; warning
+    @(1000.0000 mm, 103.8100 mm): 垂直线, 长度 25.0000 mm
+[endpoint_off_grid]: 符号引脚或连线没有与栅格对齐
+    ; warning
+    @(996.1900 mm, 350.0000 mm): 水平线, 长度 25.0000 mm
+[endpoint_off_grid]: 符号引脚或连线没有与栅格对齐
+    ; warning
+    @(1000.0000 mm, 96.1900 mm): Symbol C2 引脚 1 [无源, 图线]
+
+ ** ERC 信息: 63 个错误 24 个警告 39

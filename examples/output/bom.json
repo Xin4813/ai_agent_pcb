@@ -1,0 +1,69 @@
+{
+  "project": "Arduino 最小系统板 (ATmega328P-PU)",
+  "items": [
+    {
+      "ref": "U1",
+      "name": "ATmega328P-PU",
+      "value": "ATmega328P-P",
+      "qty": 1,
+      "symbol": "MCU_Microchip_ATmega:ATmega328P-P",
+      "footprint": "Package_DIP:DIP-28_W11.18mm"
+    },
+    {
+      "ref": "Y1",
+      "name": "晶振 16MHz",
+      "value": "16MHz",
+      "qty": 1,
+      "symbol": "Device:Crystal",
+      "footprint": ""
+    },
+    {
+      "ref": "C1",
+      "name": "瓷片电容 22pF",
+      "value": "22pF",
+      "qty": 1,
+      "symbol": "Device:C",
+      "footprint": ""
+    },
+    {
+      "ref": "C2",
+      "name": "瓷片电容 22pF",
+      "value": "22pF",
+      "qty": 1,
+      "symbol": "Device:C",
+      "footprint": ""
+    },
+    {
+      "ref": "C3",
+      "name": "去耦电容 100nF",
+      "value": "100nF",
+      "qty": 1,
+      "symbol": "Device:C",
+      "footprint": ""
+    },
+    {
+      "ref": "R1",
+      "name": "电阻 10kΩ",
+      "value": "10k",
+      "qty": 1,
+      "symbol": "Device:R",
+      "footprint": ""
+    },
+    {
+      "ref": "R2",
+      "name": "电阻 330Ω",
+      "value": "330",
+      "qty": 1,
+      "symbol": "Device:R",
+      "footprint": ""
+    },
+    {
+      "ref": "D1",
+      "name": "LED 指示灯",
+      "value": "LED",
+      "qty": 1,
+      "symbol": "Device:LED",
+      "footprint": ""
+    }
+  ]
+}
