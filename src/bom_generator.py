@@ -44,6 +44,8 @@ SYS_BOM = (
     '"qty":数量,"symbol":"KiCad 符号库ID 如 Device:C","footprint":"封装(可空)","desc":"说明(可空)"}]}'
     "\n【硬性要求】symbol 必须是下面“可用符号目录”里真实存在的 lib_id 之一"
     "（必须严格一致，包括库前缀与符号名，不要自己编造或用近似名）："
+    "\n\n【位号规则】每个 ref 只能对应一个元件；若有多个同型号元件，必须写成独立条目"
+    "（如 C1、C2 两条），绝不要把多个位号塞进同一个 ref 字符串（例如写成 \"C1,C2\"）。"
 )
 
 
@@ -92,6 +94,35 @@ def _extract_json(text: str):
     return json.loads(text)
 
 
+def _expand_bom_refs(bom: dict) -> dict:
+    """把 BOM 中合并写的位号（如 ref="C1,C2"、"C1 C2"、"C1，C2"）拆成独立条目。
+
+    LLM 常把多个同型号元件的位号塞进一个 ref 字符串，而下游的网表校验
+    (validator.validate_netlist) 与原理图渲染 (kicad_writer) 都只认“一个 ref 对应一个
+    元件”，必须从源头展平，否则网表引用 C1 时在校验里找不到（只有 "C1,C2" 这个字符串）。
+    """
+    new_items = []
+    for it in bom.get("items", []):
+        ref = str(it.get("ref", "")).strip()
+        parts = re.split(r"[,，;；\s]+", ref)
+        parts = [p for p in parts if p]
+        if len(parts) <= 1:
+            new_items.append(it)
+            continue
+        try:
+            base_qty = int(it.get("qty", len(parts)))
+        except (ValueError, TypeError):
+            base_qty = len(parts)
+        per = max(1, base_qty // len(parts)) if base_qty >= len(parts) else 1
+        for p in parts:
+            ni = dict(it)               # 浅拷贝其余字段（symbol/value/footprint/desc）
+            ni["ref"] = p
+            ni["qty"] = per
+            new_items.append(ni)
+    bom["items"] = new_items
+    return bom
+
+
 def _check_symbols(bom: dict, symbol_lib) -> list:
     """校验 BOM 中每个 symbol 是否在 KiCad 符号库里真实存在。
 
@@ -126,7 +157,7 @@ def generate_bom(prompt: str, llm=None, mock: bool = False, max_retries: int = 3
     if mock or llm is None:
         if board is None:
             raise RuntimeError("离线模式且未匹配到内置板卡；请提供 LLM 密钥以生成。")
-        return board["bom"], False
+        return _expand_bom_refs(board["bom"]), False
 
     # 可用符号目录（本机校验过的真实 lib_id）
     catalog = _build_catalog(symbol_lib)
@@ -144,6 +175,7 @@ def generate_bom(prompt: str, llm=None, mock: bool = False, max_retries: int = 3
         try:
             raw = llm.complete(sys_prompt, user)
             bom = _extract_json(raw)
+            bom = _expand_bom_refs(bom)          # 展平合并位号（如 "C1,C2" → C1、C2）
             validate_bom(bom)
             if symbol_lib is not None:
                 notes = _check_symbols(bom, symbol_lib)
