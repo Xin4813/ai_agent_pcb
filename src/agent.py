@@ -3,6 +3,8 @@ from __future__ import annotations
 import re
 from .bom_generator import generate_bom
 from .netlist_generator import generate_netlist
+from .config import kicad_symbols_dir
+from .symbol_lib import SymbolLib
 
 
 class Agent:
@@ -10,18 +12,25 @@ class Agent:
         self.cfg = cfg or {}
         self.mock = mock
         self.llm = None
+        self.symbol_lib = None
         if not mock and cfg:
             try:
                 from .llm_client import LLMClient
                 self.llm = LLMClient(cfg)
             except Exception:
                 self.llm = None
+            try:
+                d = kicad_symbols_dir(cfg)
+                if d.exists():
+                    self.symbol_lib = SymbolLib(d)
+            except Exception:
+                self.symbol_lib = None
         self.state = {"bom": None, "netlist": None, "history": []}
 
     def design(self, prompt: str):
         """步骤②③④：需求 → BOM → 网表。返回 (bom, netlist, used_llm)。"""
-        bom, used = generate_bom(prompt, self.llm, mock=self.mock)
-        netlist, _ = generate_netlist(prompt, bom, self.llm, mock=self.mock)
+        bom, used = generate_bom(prompt, self.llm, mock=self.mock, symbol_lib=self.symbol_lib)
+        netlist, _ = generate_netlist(prompt, bom, self.llm, mock=self.mock, symbol_lib=self.symbol_lib)
         self.state["bom"] = bom
         self.state["netlist"] = netlist
         self.state["prompt"] = prompt
@@ -45,7 +54,7 @@ class Agent:
         # 网表结构不变，仍以原始需求重算以保持一致（离线模式也能命中内置板卡）
         prompt = self.state.get("prompt", instruction)
         self.state["netlist"], _ = generate_netlist(
-            prompt, self.state["bom"], self.llm, mock=self.mock
+            prompt, self.state["bom"], self.llm, mock=self.mock, symbol_lib=self.symbol_lib
         )
         self.state["history"].append(instruction)
         return True

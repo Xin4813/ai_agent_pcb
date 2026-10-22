@@ -33,7 +33,7 @@ def validate_netlist(netlist: dict, bom: dict) -> None:
                 raise ValidationError(f"引脚格式应为 REF:引脚号，得到: {pin}")
             ref, _, num = pin.partition(":")
             if ref not in refs:
-                raise ValidationError(f"网表引用了 BOM 中不存在的元件: {ref}")
+                raise ValidationError(f"网表引用了 BOM 中不存在的元件: {ref}（BOM 实际位号：{sorted(refs)}）")
             if pin in seen_pins:
                 raise ValidationError(f"引脚出现在多个网络（冲突）: {pin}")
             try:

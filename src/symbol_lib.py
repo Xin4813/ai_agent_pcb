@@ -75,6 +75,7 @@ class SymbolLib:
     def __init__(self, symbols_dir: str | Path):
         self.dir = Path(symbols_dir)
         self._cache = {}  # lib_file -> parsed root
+        self._all_symbols_cache = None  # lib_id 全量缓存
 
     def _load(self, lib_name: str):
         if lib_name in self._cache:
@@ -86,6 +87,83 @@ class SymbolLib:
         root = _parse(_tokenize(text))
         self._cache[lib_name] = root
         return root
+
+    def list_symbols(self) -> list:
+        """返回该目录所有 .kicad_sym 中对外可用的 lib_id（形如 'Device:C'）。
+
+        仅取 .kicad_sym 顶层 (symbol ...) 节点——它们是公开 lib_id；
+        嵌套的子单元符号（如 C_0_1）不计（不是独立 lib_id）。
+        结果按 lib_id 字典序排序，用于把「真实可用符号目录」喂给 LLM，
+        避免模型编造不存在的 lib_id。
+        """
+        if self._all_symbols_cache is not None:
+            return self._all_symbols_cache
+        out = []
+        for f in sorted(self.dir.glob("*.kicad_sym")):
+            lib_name = f.stem
+            try:
+                root = self._load(lib_name)
+            except Exception:
+                continue
+            for child in root:
+                if (isinstance(child, list) and child and child[0] == "symbol"
+                        and len(child) > 1 and isinstance(child[1], str)):
+                    name = child[1].strip('"')
+                    if name:
+                        out.append(f"{lib_name}:{name}")
+        out.sort()
+        self._all_symbols_cache = out
+        return out
+
+    def suggest_lib_id(self, bad: str) -> str | None:
+        """为一个不存在的 lib_id 推荐最接近的、真实存在的 lib_id。
+
+        匹配优先级：① 符号名完全一致(库也对) > ② 符号名完全一致(库可不同) >
+        ③ 符号名包含查询 > ④ 查询是符号名的子序列(容忍封装后缀/字母差异) >
+        ⑤ 仅库名一致。用于 BOM 校验报错时给出可改用的正确符号。
+        同分时优先符号名更短、库名一致者，避免推荐过长的变体。
+        """
+        bad = (bad or "").strip()
+        if not bad:
+            return None
+        lib, _, name = bad.partition(":")
+        name_l = name.lower()
+        lib_l = lib.lower()
+        qnorm = re.sub(r"[^a-z0-9]", "", name_l)
+
+        def is_subseq(a: str, b: str) -> bool:
+            it = iter(b)
+            return all(ch in it for ch in a)
+
+        best = None
+        best_key = (-1, -1 << 30, 1, "")
+        for s in self.list_symbols():
+            sl, _, sn = s.partition(":")
+            sn_l = sn.lower()
+            snn = re.sub(r"[^a-z0-9]", "", sn_l)
+            score = 0
+            if sn_l == name_l and (not lib_l or sl.lower() == lib_l):
+                score = 100
+            elif sn_l == name_l:
+                score = 90
+            elif name_l and name_l in sn_l:
+                score = 80
+            elif qnorm and snn and is_subseq(qnorm, snn):
+                score = 60
+            elif qnorm and snn and (snn.startswith(qnorm[:6]) or qnorm.startswith(snn[:6])):
+                # 家族前缀一致（如 atmega328 系列），容忍封装/尾缀差异
+                score = 55
+            elif lib_l and sl.lower() == lib_l:
+                score = 40
+            if score <= 0:
+                continue
+            # 同分：符号名更短优先；再库名一致优先；再字典序
+            same_lib = 1 if (lib_l and sl.lower() == lib_l) else 0
+            key = (score, -len(sn), -same_lib, s)
+            if key > best_key:
+                best_key = key
+                best = s
+        return best
 
     def _symbol_node(self, lib_id: str):
         lib_name, _, sym_name = lib_id.partition(":")
@@ -140,8 +218,33 @@ class SymbolLib:
     def pin_numbers(self, lib_id: str):
         return sorted(self.get_pins(lib_id).keys())
 
-    def get_symbol_definitions(self, lib_id: str) -> list:
+    def pin_names(self, lib_id: str) -> dict:
+        """返回 {引脚号(int): 引脚名(str)}。引脚名来自 pin 节点内的 (name "...") 子节点。
+
+        供真实 LLM 模式把「每个元件可用的真实引脚号+引脚名」作为事实依据注入提示词，
+        避免模型瞎猜引脚导致网表非法。
+        """
+        names = {}
+        for node in self._resolve_chain(lib_id):
+            for pin_node in _collect_pins(node):
+                num = _find_sub(pin_node, "number")
+                nm = _find_sub(pin_node, "name")
+                if num is None:
+                    continue
+                try:
+                    n = int(num[1].strip('"'))
+                except (ValueError, IndexError):
+                    continue
+                name = nm[1].strip('"') if (nm and len(nm) > 1) else ""
+                names[n] = name
+        return names
+
+    def get_symbol_definitions(self, lib_id: str, qualified: bool = False) -> list:
         """返回该符号用于内嵌到 .kicad_sch 的 (lib_symbols ...) 的 S-expression 文本。
+
+        qualified=True 时，内嵌符号顶层（及嵌套子单元）名改为带库前缀的全名
+        （如 "Device:C"）——这是 KiCad 标准原理图的写法，实例的 lib_id 与内嵌
+        定义同名，ERC 不再报「当前配置不包含库 ''」。
 
         关键：KiCad 的原理图解析器**无法在 lib_symbols 内解析 extends 继承链**，
         直接内嵌带 extends 的符号会导致整个原理图「加载失败」。因此这里把继承链
@@ -151,10 +254,16 @@ class SymbolLib:
         chain = self._resolve_chain(lib_id)
         if not chain:
             return []
-        self_name = chain[-1][1]
         base = copy.deepcopy(chain[0])
-        # 把顶层与所有嵌套子符号名统一重命名为目标符号名
-        _rename_symbol(base, chain[0][1], self_name)
+        if qualified:
+            # KiCad 标准写法：顶层符号名带库前缀（如 "Device:C"），
+            # 但嵌套单元符号（C_0_1 / C_1_1）只含裸符号名、不带前缀。
+            _, _, base_sym = lib_id.partition(":")
+            _rename_symbol(base, chain[0][1], f'"{base_sym}"')
+            base[1] = f'"{lib_id}"'
+        else:
+            # 把顶层与所有嵌套子符号名统一重命名为目标符号名
+            _rename_symbol(base, chain[0][1], chain[-1][1])
         # 移除 extends（已内联）
         base = [c for c in base if not (isinstance(c, list) and c and c[0] == "extends")]
         # 自底向上应用派生层的覆盖（属性、子符号等）
