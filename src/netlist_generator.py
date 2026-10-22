@@ -75,6 +75,98 @@ def _check_pins_exist(nl: dict, bom: dict, symbol_lib) -> None:
                 )
 
 
+def _is_power_net(name: str) -> bool:
+    """粗略判断一个网络名是否为电源/地网络（用于冲突引脚的归属裁决）。"""
+    u = (name or "").upper()
+    keys = ("VCC", "GND", "VDD", "VSS", "AVCC", "AREF", "+5V", "+3.3V",
+            "+3V3", "3V3", "V+", "V-", "+5", "+3.3")
+    return any(k in u for k in keys)
+
+
+def _self_heal_netlist(nl: dict, bom: dict, valid_ref_set, symbol_lib) -> dict:
+    """把校验不过的网表就地修复为可被 KiCad 解析的合法网表（真实 LLM 模式的鲁棒兜底）：
+       1) 丢弃 BOM 中不存在的位号（模型臆造元件）；
+       2) 若提供符号库，进一步丢弃「位号存在但引脚号不存在」的引脚（模型臆造引脚）；
+       3) 同一引脚出现在多个网络时，优先把它保留在电源/地网络，否则保留在首次出现的网络。
+    """
+    # 1) BOM 不存在的位号直接丢弃（整条连接无效）
+    for net in nl.get("nets", []):
+        net["pins"] = [p for p in net.get("pins", [])
+                       if p.partition(":")[0] in valid_ref_set]
+    nl["nets"] = [n for n in nl["nets"] if n.get("pins")]
+    # 2) 符号里不存在的引脚号丢弃
+    if symbol_lib is not None:
+        sym_of = {it["ref"]: it["symbol"] for it in bom["items"]}
+        for net in nl["nets"]:
+            kept = []
+            for p in net["pins"]:
+                ref, _, num = p.partition(":")
+                sym = sym_of.get(ref)
+                if sym is None:
+                    continue
+                try:
+                    n = int(num)
+                    avail = symbol_lib.get_pins(sym).keys()
+                except Exception:
+                    continue
+                if n in avail:
+                    kept.append(p)
+            net["pins"] = kept
+        nl["nets"] = [n for n in nl["nets"] if n.get("pins")]
+    # 3) 解决「同一引脚出现在多个网络」的冲突
+    sym_of = {it["ref"]: it["symbol"] for it in bom["items"]}
+
+    def _pin_name(p):
+        if symbol_lib is None:
+            return ""
+        ref, _, num = p.partition(":")
+        sym = sym_of.get(ref)
+        if sym is None:
+            return ""
+        try:
+            return symbol_lib.pin_names(sym).get(int(num), "")
+        except Exception:
+            return ""
+
+    def _is_power_pin(p):
+        n = _pin_name(p).upper()
+        return any(k in n for k in ("VCC", "GND", "VDD", "VSS", "AVCC", "AREF", "+", "-"))
+
+    pin_occ = {}  # pin -> [(net_index, net_name), ...]
+    for i, net in enumerate(nl["nets"]):
+        for p in net.get("pins", []):
+            pin_occ.setdefault(p, []).append((i, net.get("name", "")))
+    conflicts = {p: occ for p, occ in pin_occ.items() if len(occ) > 1}
+    if conflicts:
+        keep_net = {}
+        for p, occ in conflicts.items():
+            if _is_power_pin(p):
+                # 电源引脚：优先保留在电源/地网络
+                chosen = next((idx for idx, name in occ if _is_power_net(name)), occ[0][0])
+            else:
+                # 信号引脚：优先保留在「非电源」网络，避免被错接到 VCC/GND 造成短路；
+                # 若所有冲突网络都是电源网（模型把信号脚同时塞进 VCC/GND），保留首次出现。
+                chosen = next((idx for idx, name in occ if not _is_power_net(name)), occ[0][0])
+            keep_net[p] = chosen
+        new_nets = []
+        for i, net in enumerate(nl["nets"]):
+            local_seen = set()
+            kept = []
+            for p in net.get("pins", []):
+                if p in conflicts and keep_net.get(p) != i:
+                    continue  # 该引脚应保留在别的网络
+                if p in local_seen:
+                    continue  # 同网内重复，去重
+                local_seen.add(p)
+                kept.append(p)
+            if kept:
+                net = dict(net)
+                net["pins"] = kept
+                new_nets.append(net)
+        nl["nets"] = new_nets
+    return nl
+
+
 def generate_netlist(prompt: str, bom: dict, llm=None, mock: bool = False, max_retries: int = 3,
                      symbol_lib=None):
     board = lookup_board(prompt)
@@ -109,38 +201,12 @@ def generate_netlist(prompt: str, bom: dict, llm=None, mock: bool = False, max_r
                 _check_pins_exist(nl, bom, symbol_lib)
             return nl, True
         except ValidationError as e:
-            msg = str(e)
-            # 自纠错回落：网表引用了 BOM 中不存在的位号 / 引用了符号里不存在的引脚号，
-            # 这两类都对应“模型臆造的元件或引脚”，直接丢弃相关连接（而非让整条流水线崩溃），
-            # 剩余网络仍可被 KiCad 正确解析（未连接引脚本就是 ERC 预期内的警告）。
-            if nl is not None and ("BOM 中不存在的元件" in msg or "不存在于符号" in msg):
+            # 自纠错回落：校验不通过的网表（无论是因为臆造位号/引脚，还是同一引脚
+            # 出现在多个网络等冲突）都先尝试本地修复，修复成功就直接返回，避免整条
+            # 流水线崩溃。修复仍失败才把错误回灌给模型重试。
+            if nl is not None:
                 try:
-                    # 1) 丢弃引用了 BOM 中不存在位号的引脚（整条连接无效）
-                    for net in nl.get("nets", []):
-                        net["pins"] = [
-                            p for p in net.get("pins", [])
-                            if p.partition(":")[0] in valid_ref_set
-                        ]
-                    nl["nets"] = [n for n in nl["nets"] if n.get("pins")]
-                    # 2) 若提供了符号库，进一步丢弃“位号存在但引脚号不存在”的引脚
-                    if symbol_lib is not None:
-                        sym_of = {it["ref"]: it["symbol"] for it in bom["items"]}
-                        for net in nl["nets"]:
-                            kept = []
-                            for p in net["pins"]:
-                                ref, _, num = p.partition(":")
-                                sym = sym_of.get(ref)
-                                if sym is None:
-                                    continue
-                                try:
-                                    n = int(num)
-                                    avail = symbol_lib.get_pins(sym).keys()
-                                except (ValueError, Exception):
-                                    continue
-                                if n in avail:
-                                    kept.append(p)
-                            net["pins"] = kept
-                        nl["nets"] = [n for n in nl["nets"] if n.get("pins")]
+                    nl = _self_heal_netlist(nl, bom, valid_ref_set, symbol_lib)
                     validate_netlist(nl, bom)
                     if symbol_lib is not None:
                         _check_pins_exist(nl, bom, symbol_lib)
