@@ -58,3 +58,24 @@ class Agent:
         )
         self.state["history"].append(instruction)
         return True
+
+    def revise_erc(self, erc_text: str):
+        """规则检查闭环（步骤⑤进阶）：把 ERC 违规报告回灌给 LLM，让它在不增删
+        元件的前提下只调整引脚连接关系来消除违规，并重生成原理图所需的网表。
+
+        仅真实 LLM 模式可用（mock 模式依赖内置板卡、无法按任意反馈重算）。
+        返回 (netlist, 是否成功)；失败返回 (None, False)。
+        """
+        if self.mock or self.llm is None or not self.state.get("bom"):
+            return None, False
+        try:
+            prompt = self.state.get("prompt", "")
+            nl, _ = generate_netlist(
+                prompt, self.state["bom"], self.llm, mock=False,
+                symbol_lib=self.symbol_lib, feedback=erc_text,
+            )
+            self.state["netlist"] = nl
+            self.state["history"].append("[ERC闭环] 依据违规报告修订网表")
+            return nl, True
+        except Exception:
+            return None, False

@@ -84,7 +84,10 @@ def _layout(items, lib) -> tuple[dict, str]:
     """
     cells = []
     for it in items:
-        pins = lib.get_pins(it["symbol"])
+        try:
+            pins = lib.get_pins(it["symbol"])
+        except Exception:
+            pins = {}
         if pins:
             mx = max(abs(p[0]) for p in pins.values())
             my = max(abs(p[1]) for p in pins.values())
@@ -123,7 +126,13 @@ def write_schematic(netlist: dict, bom: dict, output_path, symbols_dir) -> Path:
     lib = SymbolLib(symbols_dir)
     items, alias = _expand_refs(bom["items"])
     positions, paper = _layout(items, lib)
-    pin_cache = {it["ref"]: (it["symbol"], lib.get_pins(it["symbol"])) for it in items}
+    pin_cache = {}
+    for it in items:
+        try:
+            pins = lib.get_pins(it["symbol"])
+        except Exception:
+            pins = {}
+        pin_cache[it["ref"]] = (it["symbol"], pins)
 
     # 每个符号的占位包围盒 (x, y, 半宽, 半高)，供 PWR_FLAG 放置避让
     boxes = []

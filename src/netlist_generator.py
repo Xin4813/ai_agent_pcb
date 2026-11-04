@@ -168,7 +168,7 @@ def _self_heal_netlist(nl: dict, bom: dict, valid_ref_set, symbol_lib) -> dict:
 
 
 def generate_netlist(prompt: str, bom: dict, llm=None, mock: bool = False, max_retries: int = 3,
-                     symbol_lib=None):
+                     symbol_lib=None, feedback: str = ""):
     board = lookup_board(prompt)
     if mock or llm is None:
         if board is None:
@@ -185,6 +185,13 @@ def generate_netlist(prompt: str, bom: dict, llm=None, mock: bool = False, max_r
                   f"{', '.join(valid_refs)}\n")
     if pin_ref:
         base_user += "\n" + pin_ref
+    if feedback:
+        # 规则检查闭环：把上一轮 ERC/DRC 的违规报告作为修正依据回灌给模型，
+        # 让它在不改变元件清单的前提下只调整引脚连接关系来消除违规。
+        base_user += (
+            "\n\n[上一轮规则检查(ERC)报告，请据此只修改引脚连接关系以"
+            "消除这些违规，不要增删元件、不要臆造位号/引脚]：\n" + feedback
+        )
     base_user += "\n请给出引脚级连接网表。"
 
     last = None
