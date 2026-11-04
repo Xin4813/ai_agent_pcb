@@ -90,18 +90,35 @@ def run_erc(sch_path: Path, cli) -> dict:
     return {"ok": True, "violations": violations, "report": report, "error": ""}
 
 
-def export_svg(sch_path: Path, cli) -> str | None:
-    """导出原理图为 SVG 文本（用于浏览器内预览）；失败返回 None。"""
+def export_svg(sch_path: Path, cli) -> tuple[str | None, str]:
+    """导出原理图为 SVG 文本（用于浏览器内预览）。
+
+    返回 (svg_text, error)：成功时 error 为空，失败时 svg_text 为 None 且
+    error 含真实原因（便于前端排查）。
+
+    注意：KiCad 8 的 `sch export svg` 把 `--output` 当作**输出目录**（不同于 ERC
+    的 `--output` 是报告文件路径），导出的文件名固定为「原理图名 + .svg」，
+    因此这里传目录并在目录里取对应文件名，而非把文件路径当 --output。
+    """
     if not cli:
-        return None
-    svg = sch_path.with_suffix(".svg")
-    res = _run([cli, "sch", "export", "svg", "--output", str(svg), str(sch_path)])
-    if not res["ok"] or not svg.exists():
-        return None
+        return None, "kicad-cli 不可用"
+    out_dir = sch_path.parent
+    expected = out_dir / (sch_path.stem + ".svg")
+    res = _run([cli, "sch", "export", "svg", "--no-background-color",
+                "--output", str(out_dir), str(sch_path)])
+    if not res["ok"]:
+        return None, "kicad-cli 执行失败：" + (res.get("err") or "未知错误")
+    svg = expected if expected.exists() else None
+    if svg is None:
+        # 兜底：取目录里最近生成的 svg
+        cands = sorted(out_dir.glob("*.svg"), key=lambda p: p.stat().st_mtime, reverse=True)
+        svg = cands[0] if cands else None
+    if svg is None:
+        return None, f"未生成 SVG（输出目录：{out_dir}；kicad 报错：{(res.get('err') or '')[:200]}）"
     try:
-        return svg.read_text(encoding="utf-8", errors="ignore")
-    except Exception:
-        return None
+        return svg.read_text(encoding="utf-8", errors="ignore"), ""
+    except Exception as e:  # noqa: BLE001
+        return None, f"读取 SVG 失败：{e}"
 
 
 def run_design(prompt: str, mock: bool, autofix: bool, max_fix: int = 2) -> dict:
@@ -145,7 +162,7 @@ def run_design(prompt: str, mock: bool, autofix: bool, max_fix: int = 2) -> dict
         (out_dir / "netlist.json").write_text(json.dumps(nl, ensure_ascii=False, indent=2), encoding="utf-8")
         sch = write_schematic(nl, bom, sch, sym_dir)
 
-    svg = export_svg(sch, cli)
+    svg, svg_err = export_svg(sch, cli)
     return {
         "ok": True,
         "source": "LLM" if used else "离线知识库",
@@ -154,6 +171,7 @@ def run_design(prompt: str, mock: bool, autofix: bool, max_fix: int = 2) -> dict
         "netlist": netlist,
         "sch": str(sch),
         "svg": svg,
+        "svg_error": svg_err,
         "erc": last_erc,
         "loop": loop,
         "kicad_cli": cli or "",

@@ -201,7 +201,7 @@ function render(d){
   // schematic
   const c=$('#canvas'); c.innerHTML='';
   if(d.svg){ const div=document.createElement('div'); div.innerHTML=d.svg; const svg=div.querySelector('svg'); if(svg){ svg.removeAttribute('width'); svg.removeAttribute('height'); svg.style.width='100%'; c.appendChild(svg);} }
-  else c.innerHTML='<div class="hint" style="padding:20px">kicad-cli 不可用或导出失败，无法预览（请确认本机已安装 KiCad 8）。</div>';
+  else c.innerHTML='<div class="hint" style="padding:20px">⚠️ 原理图预览失败：'+(d.svg_error||'kicad-cli 不可用或导出失败（请确认本机已安装 KiCad 8）。')+'</div>';
   zoom=1; c.style.transform='scale(1)'; $('#zoomHint').textContent='100%';
 
   // bom
