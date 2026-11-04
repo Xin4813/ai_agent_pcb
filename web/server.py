@@ -51,7 +51,12 @@ def _kicad_cli(cfg) -> str | None:
 
 def _run(cmd) -> dict:
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+        # 显式用 UTF-8 读取管道输出：中文 Windows 默认 locale 编码是 GBK，
+        # 而 kicad-cli 输出为 UTF-8，二者不一致会在 capture_output 的后台读线程里
+        # 抛 UnicodeDecodeError（'gbk' codec can't decode ...）。errors="replace"
+        # 兜底，避免个别非法字节导致整条流水线崩溃。
+        r = subprocess.run(cmd, capture_output=True, text=True,
+                           encoding="utf-8", errors="replace", timeout=180)
         return {"ok": True, "rc": r.returncode, "out": r.stdout, "err": r.stderr}
     except FileNotFoundError:
         return {"ok": False, "rc": -1, "out": "", "err": "kicad-cli 未找到"}
