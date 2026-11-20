@@ -24,6 +24,24 @@ _VALUE_RE = re.compile(
     r"^\s*\d+(?:\.\d+)?\s*(?:ohms?|Ω|nF|pF|uF|µF|μF|mF|Hz|k|m|g|r|V|A)\s*\.?\s*$", re.I)
 
 
+def _sanitize_value(content: str) -> str:
+    """清洗新内容，防止把整句指令误写进 value（历史脏数据防御）。
+
+    旧版解析器曾把「把C1换成22uF，把C2换成10uF」的后半句塞进 C1 的 value，
+    得到 `22uF，把C2换成22uF` 这类脏值。这里把混入的指令尾巴截掉，只保留
+    第一段有效值。
+    """
+    s = (content or "").strip()
+    # 按分隔符切开，若后续片段含换值动词或「把/将 X」结构，视为混入的指令，截断
+    parts = re.split(r"[,，、;；]", s)
+    kept = [parts[0]]
+    for p in parts[1:]:
+        if _VERB_RE.search(p) or re.match(r"^\s*(?:把|将)\s", p):
+            break
+        kept.append(p)
+    return re.sub(r"\s+", "", ",".join(kept)).strip(",")
+
+
 def _parse_revision(text: str):
     """解析「把 X 换成 Y」指令，返回 (目标列表, 新内容)。
 
@@ -46,6 +64,41 @@ def _parse_revision(text: str):
     # 目标可能是多个，用逗号/空格/顿号分隔；也可能带"的"后缀（"电容的"）
     parts = [p.strip(" 的") for p in re.split(r"[,，、\s]+", target_part) if p.strip(" 的")]
     return parts, new_part
+
+
+# 子句切分符（逗号/分号/顿号）——注意顿号既是「多目标分隔符」也可能是「子句分隔符」，
+# 靠「片段是否含换值动词」来区分：不含动词的片段并入后面含动词的片段作为目标。
+_CLAUSE_SPLIT_RE = re.compile(r"[,，、;；]")
+_VERB_RE = re.compile(r"换成|改为|替换成|改成|变更为|替换为|设置为|设成|调成")
+
+
+def _parse_revisions(text: str):
+    """把一条指令解析成多个 (目标列表, 新内容) 子句。
+
+    同时支持两种写法（也可混用）：
+      • 多目标共享一个值：「把 C1、C2 换成 20uF」
+      • 多条独立子句：「把 C1 换成 22uF，把 C2 换成 10uF」
+        （分隔符可用 逗号/顿号/分号，第二句可省略「把」）
+    全部解析不出返回 None。
+    """
+    s = (text or "").strip()
+    if not s:
+        return None
+    pieces = [p.strip() for p in _CLAUSE_SPLIT_RE.split(s) if p.strip()]
+    clauses, buf = [], ""
+    for p in pieces:
+        buf = (buf + "，" + p) if buf else p
+        if _VERB_RE.search(p):
+            clauses.append(buf)
+            buf = ""
+    if buf:
+        clauses.append(buf)
+    out = []
+    for cl in clauses:
+        targets, new = _parse_revision(cl)
+        if targets and new:
+            out.append((targets, new))
+    return out or None
 
 
 class Agent:
@@ -105,61 +158,74 @@ class Agent:
         if not self.state.get("bom"):
             self.state["last_revision"] = "还没有设计结果，无法修改"
             return False
-        targets, new_content = _parse_revision(instruction)
-        if not targets or not new_content:
+        revisions = _parse_revisions(instruction)
+        if not revisions:
             self.state["last_revision"] = "没识别出来，试试「把 C1 换成 22uF」或「稳压器换成 AMS1117-5.0」"
             return False
 
         items = self.state["bom"]["items"]
         by_ref = {it["ref"]: it for it in items}
 
-        # 目标 → 具体位号集合
-        hit_refs = []
-        for t in targets:
-            if t in by_ref:                       # 精确位号
-                hit_refs.append(t)
-                continue
-            tl = t.lower()
-            hints = None
-            for kw, prefixes in _TYPE_HINTS.items():
-                if kw.lower() in tl or tl in kw.lower():
-                    hints = prefixes
-                    break
-            if hints:
-                for it in items:
-                    sym = it.get("symbol", "")
-                    if any(sym.startswith(p) for p in hints) and it["ref"] not in hit_refs:
-                        hit_refs.append(it["ref"])
-        if not hit_refs:
-            self.state["last_revision"] = f"找不到元件「{', '.join(targets)}」，当前位号：{', '.join(by_ref)}"
-            return False
-
-        # 新内容：真实型号 → 换 symbol；否则只改 value
-        new_symbol = None
-        if self.symbol_lib is not None and not _VALUE_RE.match(new_content):
-            new_symbol = self.symbol_lib.find_exact_symbol(new_content)
-        clean_value = re.sub(r"\s+", "", new_content)
-
         changes = []
-        for ref in hit_refs:
-            it = by_ref[ref]
-            old = f'{it.get("value", "")}'
-            it["value"] = clean_value
-            if new_symbol:
-                old_sym = it.get("symbol", "")
-                it["symbol"] = new_symbol
-                changes.append(f"{ref}: {old_sym} → {new_symbol}，{old} → {clean_value}")
-            else:
-                changes.append(f"{ref}: {old} → {clean_value}")
+        any_symbol_change = False
+        unmatched = []
+        for targets, new_content in revisions:
+            # 目标 → 具体位号集合
+            hit_refs = []
+            for t in targets:
+                if t in by_ref:                   # 精确位号
+                    hit_refs.append(t)
+                    continue
+                tl = t.lower()
+                hints = None
+                for kw, prefixes in _TYPE_HINTS.items():
+                    if kw.lower() in tl or tl in kw.lower():
+                        hints = prefixes
+                        break
+                if hints:
+                    for it in items:
+                        sym = it.get("symbol", "")
+                        if any(sym.startswith(p) for p in hints) and it["ref"] not in hit_refs:
+                            hit_refs.append(it["ref"])
+            if not hit_refs:
+                unmatched.extend(targets)
+                continue
+
+            # 新内容：真实型号 → 换 symbol；否则只改 value
+            new_symbol = None
+            if self.symbol_lib is not None and not _VALUE_RE.match(new_content):
+                new_symbol = self.symbol_lib.find_exact_symbol(new_content)
+            clean_value = _sanitize_value(new_content)
+
+            for ref in hit_refs:
+                it = by_ref[ref]
+                old = f'{it.get("value", "")}'
+                it["value"] = clean_value
+                if new_symbol:
+                    any_symbol_change = True
+                    old_sym = it.get("symbol", "")
+                    it["symbol"] = new_symbol
+                    changes.append(f"{ref}: {old_sym} → {new_symbol}，{old} → {clean_value}")
+                else:
+                    changes.append(f"{ref}: {old} → {clean_value}")
+
+        if not changes:
+            self.state["last_revision"] = (
+                f"找不到元件「{', '.join(unmatched)}」，当前位号：{', '.join(by_ref)}"
+                if unmatched else "没识别出来，试试「把 C1 换成 22uF」"
+            )
+            return False
 
         # 换型号后过滤掉新符号不存在的引脚，保持网表合法
         nl = self.state.get("netlist")
-        if new_symbol and nl is not None and self.symbol_lib is not None:
+        if any_symbol_change and nl is not None and self.symbol_lib is not None:
             from .netlist_generator import _self_heal_netlist
             nl = _self_heal_netlist(nl, self.state["bom"], set(by_ref), self.symbol_lib)
             self.state["netlist"] = nl
 
         notes = "；".join(changes)
+        if unmatched:
+            notes += f"（未找到：{', '.join(unmatched)}）"
         self.state["history"].append(instruction)
         self.state["last_revision"] = notes
         return True
