@@ -38,6 +38,17 @@ ARDUINO_MINIMAL = {
             {"name": "LED",   "pins": ["R2:2", "D1:1"]},
         ]
     },
+    # ICSP 编程口与主控 SPI/D 脚是硬件复用关系。LLM 常把 ICSP 网络只写排针一端，
+    # 造成「一排针没连」。生成网表后据此把单脚 ICSP 网络并入对应主网络。
+    # 值 = 目标网络名（同名即同一电位），键 = 需补全的 ICSP 网络名。
+    "interface_aliases": {
+        "ICSP_MISO": "D12",
+        "ICSP_MOSI": "D11",
+        "ICSP_SCK": "D13",
+        "ICSP_RESET": "RESET",
+        "ICSP_VCC": "VCC",
+        "ICSP_GND": "GND",
+    },
 }
 
 _BOARDS = {

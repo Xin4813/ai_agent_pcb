@@ -13,9 +13,14 @@ SYS_NET = (
     "1) 每个引脚号必须真实存在于对应元器件的 KiCad 符号中（下面已给出每个元件的可用引脚）；\n"
     "2) 同一引脚只能出现在一个网络里，绝不能把同一个引脚连到两个网络；\n"
     "3) 电容/电阻只有两个引脚(1 和 2)，分别代表两端，不要重复连接同一引脚；\n"
-    "4) 不要输出 JSON 以外的任何内容；\n"
+    "4) 每个网络必须至少包含 2 个引脚，绝不允许只含单个引脚的『孤立网络』；"
+    "尤其是排针/接口(如 ICSP、USB、编程口)的每一根信号脚，都必须连到芯片或元件的具体引脚，"
+    "不能只写排针自己那一端——例如 ICSP 的 MISO/MOSI/SCK/RESET 应分别接到主控芯片对应的 SPI/复位脚，"
+    "ICSP 的 VCC/GND 接到电源/地网络；如果某个功能脚与另一个网络复用同一个芯片脚，"
+    "就把排针脚直接加入那个已有网络(用该网络名)，而不是新建一个只有排针的单脚网络；\n"
     "5) 网表里的位号(REF)必须严格来自上面给出的 BOM 位号列表，绝不允许新增、改名或臆造"
-    "任何位号（例如 BOM 里没有 C4 就绝对不要写 C4，因为 C4 对应的元件根本不存在，写了也无法渲染）。"
+    "任何位号（例如 BOM 里没有 C4 就绝对不要写 C4，因为 C4 对应的元件根本不存在，写了也无法渲染）；\n"
+    "6) 不要输出 JSON 以外的任何内容。"
 )
 
 
@@ -167,6 +172,35 @@ def _self_heal_netlist(nl: dict, bom: dict, valid_ref_set, symbol_lib) -> dict:
     return nl
 
 
+def _complete_interface_nets(nl: dict, board: dict | None) -> dict:
+    """补全「单脚接口网络」：LLM 常把 ICSP/编程口只写排针一端（芯片端漏写），
+    导致该网络只有一个引脚，原理图上就是一排没连的针。
+
+    若命中内置板卡知识里的 interface_aliases（如 ICSP_MISO→D12，硬件上二者
+    复用同一主控脚），把单脚网络的引脚并入已存在的目标网络，并删除该单脚
+    网络。只在目标网络确实存在、且来源网络确实单脚时动作，绝不臆造连接。
+    """
+    aliases = (board or {}).get("interface_aliases") or {}
+    if not aliases:
+        return nl
+    nets = nl.get("nets", [])
+    by_name = {n.get("name"): n for n in nets}
+    merged = []
+    for n in nets:
+        name = n.get("name")
+        pins = n.get("pins", [])
+        target = aliases.get(name)
+        if len(pins) == 1 and target in by_name and by_name[target] is not n:
+            dst = by_name[target]
+            for p in pins:
+                if p not in dst["pins"]:
+                    dst["pins"].append(p)
+            continue                      # 丢弃这个单脚网络
+        merged.append(n)
+    nl["nets"] = merged
+    return nl
+
+
 def generate_netlist(prompt: str, bom: dict, llm=None, mock: bool = False, max_retries: int = 3,
                      symbol_lib=None, feedback: str = ""):
     board = lookup_board(prompt)
@@ -204,6 +238,9 @@ def generate_netlist(prompt: str, bom: dict, llm=None, mock: bool = False, max_r
             raw = llm.complete(SYS_NET, user)
             nl = _extract_json(raw)
             validate_netlist(nl, bom)
+            # 补全只写排针一端的接口网络（ICSP 等），并入其复用的主网络
+            nl = _complete_interface_nets(nl, board)
+            validate_netlist(nl, bom)
             if symbol_lib is not None:
                 _check_pins_exist(nl, bom, symbol_lib)
             return nl, True
@@ -214,6 +251,8 @@ def generate_netlist(prompt: str, bom: dict, llm=None, mock: bool = False, max_r
             if nl is not None:
                 try:
                     nl = _self_heal_netlist(nl, bom, valid_ref_set, symbol_lib)
+                    validate_netlist(nl, bom)
+                    nl = _complete_interface_nets(nl, board)
                     validate_netlist(nl, bom)
                     if symbol_lib is not None:
                         _check_pins_exist(nl, bom, symbol_lib)
