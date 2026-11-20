@@ -294,12 +294,16 @@ def _fix_usb(items, ops, lib, fixes):
     dm = ops.find(f"{ur}:{ud_m}")
     if dp and dm:
         dp_usb = [p for p in dp["pins"] if p.startswith(usr + ":")]
+        dm_usb = [p for p in dm["pins"] if p.startswith(usr + ":")]
         if dp_usb and f"{usr}:{d_p}" not in dp["pins"]:
-            for p in dp_usb:
-                dp["pins"].remove(p)
-            dp["pins"].append(f"{usr}:{d_p}")
-            dm["pins"] = [p for p in dm["pins"]
-                          if not p.startswith(usr + ":")] + [f"{usr}:{d_m}"]
+            # 用 attach 统一处理：它会先把引脚从所有网络移除再加入，
+            # 避免两网直接改 list 造成同一引脚残留两处（validate 冲突）。
+            ops.attach(f"{usr}:{d_p}", dp["name"])
+            ops.attach(f"{usr}:{d_m}", dm["name"])
+            for p in dp_usb + dm_usb:
+                if p not in (f"{usr}:{d_p}", f"{usr}:{d_m}"):
+                    # 其它 USB 引脚保持原网络，不处理
+                    pass
             fixes.append(f"USB D+/D− 对调：{usr}:{d_p}→{ur}:{ud_p}，{usr}:{d_m}→{ur}:{ud_m}")
 
     xi = next(iter(_p(uart, lib, "XI")), "7")

@@ -43,6 +43,27 @@ CELL_GAP = 18.0      # 相邻元件格子的间距（容纳引出线与标签）
 PAPERS = {"A4": (297.0, 210.0), "A3": (420.0, 297.0)}
 PAGE_MX, PAGE_MY = 20.0, 20.0   # 页边距
 
+# KiCad 图纸右下角标题栏（Title Block）禁区：元件和走线都不得进入。
+# A4 标题栏约从 x=187 到 297（宽 110）、y=175 到 210（高 35），留缓冲取
+# 宽 122 / 高 42，即从 (pw-122, ph-42) 到图纸右下角。A3 标题栏同尺寸级别。
+TITLE_W, TITLE_H = 122.0, 42.0
+
+
+def _in_title_block(x: float, y: float, hw: float = 0.0, hh: float = 0.0,
+                    paper: str = "A4", whole_row: bool = False) -> bool:
+    """点/矩形是否侵入标题栏禁区（hw/hh 为半宽半高）。
+
+    whole_row=True 时把整个底部横带（y>页高-TITLE_H）都视为禁区，用于布局：
+    因为元件的引出线会朝各个方向走，只按 x/y 矩形挡会让「位于标题栏左侧、
+    但引脚已低于顶边」的元件（如 USB 座）出线时穿进标题栏。布局阶段整行留空
+    最稳妥；走线阶段仍按真实矩形挡，尽量利用空间。
+    """
+    pw, ph = PAPERS[paper]
+    tx0, ty0 = pw - TITLE_W, ph - TITLE_H
+    if whole_row:
+        return y + hh > ty0
+    return (x + hw > tx0 and y + hh > ty0)
+
 
 def _u() -> str:
     return str(uuid.uuid4())
@@ -294,6 +315,8 @@ def _layout(items, lib, netlist=None, alias=None) -> tuple[dict, str]:
                     if (cx - hw < PAGE_MX or cx + hw > pw - PAGE_MX
                             or cy - hh < PAGE_MY or cy + hh > ph - PAGE_MY):
                         continue
+                    if _in_title_block(cx, cy, hw, hh, paper, whole_row=True):
+                        continue
                     if overlap(cx, cy):
                         continue
                     candidates.append((cost(cx, cy), cx, cy))
@@ -305,6 +328,8 @@ def _layout(items, lib, netlist=None, alias=None) -> tuple[dict, str]:
                 cy0 = _snap(PAGE_MY + hh)
                 for cy in range(int(cy0), int(ph - PAGE_MY - hh) + 1, int(step)):
                     for cx in range(int(cx0), int(pw - PAGE_MX - hw) + 1, int(step)):
+                        if _in_title_block(cx, cy, hw, hh, paper, whole_row=True):
+                            continue
                         if not overlap(cx, cy):
                             candidates.append((cost(cx, cy), cx, cy))
                             break
@@ -541,7 +566,7 @@ def write_schematic(netlist: dict, bom: dict, output_path, symbols_dir) -> Path:
             fx = fy = None
             for ox, oy in cands:
                 tx, ty = _snap(ex + ox), _snap(ey + oy)
-                if not _hits_symbol(tx, ty):
+                if not _hits_symbol(tx, ty) and not _in_title_block(tx, ty, 3, 3, paper):
                     fx, fy = tx, ty
                     break
             if fx is None:
@@ -556,6 +581,11 @@ def write_schematic(netlist: dict, bom: dict, output_path, symbols_dir) -> Path:
     #    保证引出线端点仍在障碍外）。PWR_FLAG 由 owner 表避免被其他网络穿越。
     nx, ny = int(pw / GRID) + 1, int(ph / GRID) + 1
     blocked = set()
+    # 标题栏禁区列为障碍：任何网络的走线都不得穿进右下角标题栏。
+    tgi0, tgj0 = _to_grid(pw - TITLE_W, ph - TITLE_H)
+    for gi in range(max(0, tgi0), nx):
+        for gj in range(max(0, tgj0), ny):
+            blocked.add((gi, gj))
     for it in items:
         _, pins = pin_cache[it["ref"]]
         if not pins:
