@@ -150,24 +150,41 @@ def _mst_edges(points: list[tuple[int, int]]) -> list[tuple[int, int]]:
     return edges
 
 
-def _route_path(start, goal, blocked, owner, key, nx, ny):
-    """在空闲栅格上找一条「少拐弯」的正交路径。
+# 穿越一条「别人已占的走线」的代价。设为软惩罚而非硬禁止：硬禁止会
+# 把密集区域彻底封死，导致大量网络走不通、退化成断线+标签（实测标签
+# 24→38）。软惩罚让路由器「能绕则绕、绕不开才穿」，兼顾少交叉与连通。
+CROSS_COST = 40
 
-    用 Dijkstra 给每次转向加惩罚，避免最短但锯齿状的走线；不同网络已有
-    走线视为障碍。返回栅格节点列表（含起终点），失败返回 None。
+
+def _route_path(start, goal, blocked, soft, hard, key, nx, ny, end_cells=()):
+    """在栅格上找一条「少拐弯、少穿越」的正交路径。
+
+    Dijkstra 代价 = 步长 + 转向惩罚 + 穿越其它网络既有走线的软惩罚。
+    两类障碍：
+      • 符号本体 (blocked) 与「别人的端点」(hard) 是硬障碍——绝对不可穿。
+        端点若被穿越，两条不同网络的线会在同一点相连，触发 ERC
+        multiple_net_names（踩过：ICSP_MISO/SCK 被竖线同时穿过）。
+      • 别人的走线中段 (soft) 只是「贵」不是「禁」——能绕则绕、绕不开
+        才穿（十字交叉在 KiCad 里不相连），兼顾少交叉与连通。
+    soft/hard: {栅格点: {网络 key}}；end_cells 为本网端点，穿越不罚。
+    返回栅格节点列表（含起终点），失败返回 None。
     """
     if start == goal:
         return [start]
 
-    def free(node):
-        if node in (start, goal):
-            return True
-        owners = owner.get(node)
-        if owners and key in owners:      # 本网已有的线/端点可复用
-            return True
-        if node in blocked:               # 符号本体
-            return False
-        return not owners                 # 其他网络的走线不可穿越
+    own_ends = set(end_cells)
+    own_ends.add(start)
+    own_ends.add(goal)
+
+    def cross_penalty(node):
+        if node in own_ends:
+            return 0
+        users = soft.get(node)
+        if not users:
+            return 0
+        if users == {key}:            # 只有本网占用
+            return 0
+        return CROSS_COST
 
     dirs = ((1, 0), (-1, 0), (0, 1), (0, -1))
     init = (start[0], start[1], -1)
@@ -190,10 +207,14 @@ def _route_path(start, goal, blocked, owner, key, nx, ny):
             nxt = (x + dx, y + dy)
             if not (1 <= nxt[0] < nx - 1 and 1 <= nxt[1] < ny - 1):
                 continue
-            if not free(nxt):
+            if nxt in blocked and nxt not in own_ends:   # 符号本体硬障碍
+                continue
+            hard_users = hard.get(nxt)
+            if hard_users and key not in hard_users:     # 别人的端点硬障碍
                 continue
             nstate = (nxt[0], nxt[1], nd)
-            ncost = cost + 1 + (0 if direction in (-1, nd) else 4)
+            ncost = cost + 1 + (0 if direction in (-1, nd) else 4) \
+                    + cross_penalty(nxt)
             if ncost < dist.get(nstate, 10 ** 9):
                 dist[nstate] = ncost
                 prev[nstate] = state
@@ -201,8 +222,12 @@ def _route_path(start, goal, blocked, owner, key, nx, ny):
     return None
 
 
-def _shorten_path(path, blocked, owner, key):
-    """在仍可通行的前提下合并绕路产生的多余拐角，减少线段数。"""
+def _shorten_path(path, blocked, soft, hard, key):
+    """在仍可通行的前提下合并绕路产生的多余拐角，减少线段数。
+
+    与 _route_path 一致：别的网络的走线是软障碍——短缩时不主动穿过它们
+    （避免引入新交叉），但符号本体仍是硬障碍。
+    """
     if len(path) <= 2:
         return path
 
@@ -218,10 +243,13 @@ def _shorten_path(path, blocked, owner, key):
         for c in cells:
             if c in (a, b):
                 continue
-            owners = owner.get(c)
-            if owners and key in owners:
-                continue
-            if c in blocked or owners:
+            if c in blocked:                      # 符号本体不可穿
+                return False
+            hard_users = hard.get(c)
+            if hard_users and key not in hard_users:   # 别人的端点不可穿
+                return False
+            users = soft.get(c)
+            if users and users != {key}:          # 别人的线：短缩不越过
                 return False
         return True
 
@@ -758,10 +786,11 @@ def write_schematic(netlist: dict, bom: dict, output_path, symbols_dir,
             flag = (fx, fy, f"#FLG{flag_no:02d}")
 
         net_jobs.append({"name": name, "ends": ends, "flag": flag,
-                         "touched": set()})
+                         "touched": set(),
+                         "refs": {r for r, _k in ok}})
 
     # ④ 障碍物：元件符号本体（引脚包围盒 + 2.54mm，比布局占位盒小，
-    #    保证引出线端点仍在障碍外）。PWR_FLAG 由 owner 表避免被其他网络穿越。
+    #    保证引出线端点仍在障碍外）。
     nx, ny = int(pw / GRID) + 1, int(ph / GRID) + 1
     blocked = set()
     # 标题栏禁区列为障碍：任何网络的走线都不得穿进右下角标题栏。
@@ -787,38 +816,69 @@ def write_schematic(netlist: dict, bom: dict, output_path, symbols_dir,
             for gj in range(max(0, j0), min(ny, j1 + 1)):
                 blocked.add((gi, gj))
 
-    # ④ 预先登记各网络端点（含 PWR_FLAG），避免别的网络从这些点穿过去。
-    owner = {}
+    # ④ 预先登记各网络的引出线与端点。
+    #    关键：引脚引出线（stub）整段都要登记！过去只登记端点 (ex,ey)，
+    #    导致其它网络的走线可以横穿某引脚的整段 stub——这正是截图里芯片脚
+    #    附近那一小簇“不必要交叉”的来源。
+    # soft: {栅格点: {网络 key}} —— 已被哪些网络的走线占用（软障碍）。
+    # 与旧的硬 owner 不同：完整线段的每一格都登记，穿越要付 CROSS_COST，
+    # 但不是硬墙——密集区不会因为被封死而断线（旧硬墙方案标签 24→38）。
+    soft = {}
+    hard = {}   # 各网络的真实端点（含 stub 两端、PWR_FLAG）：别的网络不可穿越
+
+    def _occupy(key, a, b):
+        """把栅格 a→b 的水平/垂直线段登记到 soft。"""
+        if a[0] == b[0]:
+            step = 1 if b[1] >= a[1] else -1
+            cells = [(a[0], j) for j in range(a[1], b[1] + step, step)]
+        else:
+            step = 1 if b[0] >= a[0] else -1
+            cells = [(i, a[1]) for i in range(a[0], b[0] + step, step)]
+        for c in cells:
+            soft.setdefault(c, set()).add(key)
+
+    # 引脚引出线（stub）全程登记：别的网络横穿它要付代价（少交叉），
+    # 但真绕不开时仍能穿（保连通），自家网络穿越不罚。
     for key, job in enumerate(net_jobs):
         for e in job["ends"]:
-            owner.setdefault(_to_grid(e[2], e[3]), set()).add(key)
+            ga, gb = _to_grid(e[0], e[1]), _to_grid(e[2], e[3])
+            _occupy(key, ga, gb)
+            # 引脚端与 stub 末端都是电气连接点，设为硬障碍
+            for c in (ga, gb):
+                hard.setdefault(c, set()).add(key)
         if job["flag"]:
-            owner.setdefault(_to_grid(job["flag"][0], job["flag"][1]), set()).add(key)
-
-    # ⑤ 电源/地先走边缘母线，其余短网先走，减少长网被零碎走线挡住的概率。
-    def _cost(job):
-        pts = [_to_grid(e[2], e[3]) for e in job["ends"]]
-        total = sum(abs(pts[a][0] - pts[b][0]) + abs(pts[a][1] - pts[b][1])
-                    for a, b in _mst_edges(pts))
-        return (len(pts), total)
+            fc = _to_grid(job["flag"][0], job["flag"][1])
+            soft.setdefault(fc, set()).add(key)
+            hard.setdefault(fc, set()).add(key)
 
     def _commit(key, path):
-        path = _shorten_path(path, blocked, owner, key)
-        for node in path:
-            owner.setdefault(node, set()).add(key)
+        path = _shorten_path(path, blocked, soft, hard, key)
         for (x1, y1), (x2, y2) in _compress_segments(path):
             if (x1, y1) != (x2, y2):
+                _occupy(key, _to_grid(x1, y1), _to_grid(x2, y2))
                 _wire(x1, y1, x2, y2)
 
     def _mst_route(key, job, pts):
+        end_cells = set(pts)
+        if job["flag"]:
+            end_cells.add(_to_grid(job["flag"][0], job["flag"][1]))
         for a, b in _mst_edges(pts):
-            path = _route_path(pts[a], pts[b], blocked, owner, key, nx, ny)
+            path = _route_path(pts[a], pts[b], blocked, soft, hard, key, nx, ny, end_cells)
             if not path:
                 continue                       # 走不通时仍保留网络标签兜底
             job["touched"].update((a, b))
             _commit(key, path)
 
-    for key, job in sorted(enumerate(net_jobs), key=lambda kv: _cost(kv[1])):
+    # 布线顺序：端点多的网络先走、同等规模下总长度短的优先。
+    # 实测大网（VCC/GND）先占好主干，小网绕行，比小网先走少几处交叉。
+    def _order(kv):
+        job = kv[1]
+        pts = [_to_grid(e[2], e[3]) for e in job["ends"]]
+        total = sum(abs(pts[a][0] - pts[b][0]) + abs(pts[a][1] - pts[b][1])
+                    for a, b in _mst_edges(pts))
+        return (-len(pts), total, kv[0])
+
+    for key, job in sorted(enumerate(net_jobs), key=_order):
         pts = [_to_grid(e[2], e[3]) for e in job["ends"]]
         if job["flag"]:
             pts.append(_to_grid(job["flag"][0], job["flag"][1]))
