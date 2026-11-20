@@ -1,10 +1,51 @@
 """Agent 编排：串起 ②③④⑤ 步，并维护交互修正状态。"""
 from __future__ import annotations
 import re
+from pathlib import Path
 from .bom_generator import generate_bom
 from .netlist_generator import generate_netlist
 from .config import kicad_symbols_dir
 from .symbol_lib import SymbolLib
+
+# 元件类型词 → 候选 symbol 前缀/名（用于「把电容换成…」这类按类型批量修改）
+_TYPE_HINTS = {
+    "电容": ("Device:C",), "电容器": ("Device:C",), "去耦电容": ("Device:C",),
+    "电阻": ("Device:R",), "电阻器": ("Device:R",), "上拉电阻": ("Device:R",),
+    "发光二极管": ("Device:LED",), "led": ("Device:LED",), "指示灯": ("Device:LED",),
+    "二极管": ("Device:D",), "稳压二极管": ("Device:D_Zener",),
+    "按键": ("Switch:SW_Push",), "开关": ("Switch:SW_Push",), "按钮": ("Switch:SW_Push",),
+    "稳压器": ("Regulator_Linear:",), "稳压芯片": ("Regulator_Linear:",), "ldo": ("Regulator_Linear:",),
+    "晶振": ("Device:Crystal",), "晶体": ("Device:Crystal",),
+    "排针": ("Connector:Conn_",), "连接器": ("Connector:Conn_",), "接口": ("Connector:Conn_",),
+}
+
+# 数值+单位（10k、0.1uF、22µF、330Ω…）——这类新内容应改 value 而非 symbol
+_VALUE_RE = re.compile(
+    r"^\s*\d+(?:\.\d+)?\s*(?:ohms?|Ω|nF|pF|uF|µF|μF|mF|Hz|k|m|g|r|V|A)\s*\.?\s*$", re.I)
+
+
+def _parse_revision(text: str):
+    """解析「把 X 换成 Y」指令，返回 (目标列表, 新内容)。
+
+    支持的目标：具体位号（U1、C2）或类型词（电容、电阻、稳压器…）。
+    支持多个目标（如「R1 R2 改成 10k」）。解析不出返回 (None, None)。
+    """
+    s = (text or "").strip()
+    m = re.search(r"(?:换成|改为|替换成|改成|变更为|改为|换成的是|改成是|换成)[:：]?\s*(.+)$", s)
+    if not m:
+        m = re.search(r"(?:把|将)\s*(.+?)\s*(?:换成|改为|改成|替换为|变更成)\s*(.+)$", s)
+        if not m:
+            return None, None
+        target_part, new_part = m.group(1).strip(), m.group(2).strip()
+    else:
+        new_part = m.group(1).strip()
+        head = s[:m.start()]
+        target_part = re.sub(r"^(?:把|将|请|帮(?:我)?)\s*", "", head).strip()
+    if not target_part or not new_part:
+        return None, None
+    # 目标可能是多个，用逗号/空格/顿号分隔；也可能带"的"后缀（"电容的"）
+    parts = [p.strip(" 的") for p in re.split(r"[,，、\s]+", target_part) if p.strip(" 的")]
+    return parts, new_part
 
 
 class Agent:
@@ -19,10 +60,16 @@ class Agent:
                 self.llm = LLMClient(cfg)
             except Exception:
                 self.llm = None
+        # 符号库是本地 KiCad 资源，与 LLM/密钥无关；mock 模式也要加载，
+        # 这样离线演示也能「更换型号」（find_exact_symbol 需要它）。
+        for d in filter(None, [
+            (kicad_symbols_dir(cfg) if cfg else None),
+            Path(r"C:/Users/Gray/AppData/Local/Programs/KiCad/8.0/share/kicad/symbols"),
+        ]):
             try:
-                d = kicad_symbols_dir(cfg)
-                if d.exists():
+                if Path(d).exists():
                     self.symbol_lib = SymbolLib(d)
+                    break
             except Exception:
                 self.symbol_lib = None
         self.state = {"bom": None, "netlist": None, "history": []}
@@ -38,25 +85,83 @@ class Agent:
         return bom, netlist, used
 
     def revise(self, instruction: str) -> bool:
-        """步骤⑤（演示版）：解析“把电容换成 XX”这类指令，改 BOM 标称值后重新生成网表。
+        """步骤⑤：按自然语言指令更换元件（改标称值或型号），并重算网表。
 
-        注意：改电容标称值不改变引脚连接关系（网表结构不变），因此这里只更新
-        BOM 中的 value；若需要按原始需求重算网表，则复用最初的需求 prompt，
-        而不是用修订指令去查板卡（否则离线模式会因匹配不到板卡而报错）。
+        支持的指令（中英文混排均可）：
+          • 按位号：  「把 C1 换成 22uF」「R3 改成 1k」「U2 换成 AMS1117-5.0」
+          • 按类型：  「把电容换成 100nF」「稳压器换成 AMS1117-5.0」「LED 改成绿色」
+          • 多目标：  「C1 C2 换成 0.1uF」
+
+        处理逻辑：
+          1) 解析目标与新内容；目标可为具体位号或元件类型词。
+          2) 新内容若是本机符号库真实存在的型号 → 改 symbol + value（换型号）；
+             若是数值+单位或普通文字 → 只改 value（换标称值/颜色）。
+          3) 换型号后引脚号可能变化：用 _self_heal_netlist 丢弃新符号里不存在的
+             引脚，保证网表仍合法、ERC 仍可为 0。
+          4) 记录本轮改动说明到 state["last_revision"]，供网页展示。
+
+        返回 True 表示成功修改。保持 bool 返回以兼容 CLI 的 `if agent.revise(cmd)`。
         """
-        m = re.search(r"(\d+(?:\.\d+)?\s?(?:nF|pF|uF|µF|μF))", instruction, re.I)
-        if not m or not self.state["bom"]:
+        if not self.state.get("bom"):
+            self.state["last_revision"] = "还没有设计结果，无法修改"
             return False
-        val = m.group(1).replace(" ", "")
-        for it in self.state["bom"]["items"]:
-            if it["symbol"] == "Device:C":
-                it["value"] = val
-        # 网表结构不变，仍以原始需求重算以保持一致（离线模式也能命中内置板卡）
-        prompt = self.state.get("prompt", instruction)
-        self.state["netlist"], _ = generate_netlist(
-            prompt, self.state["bom"], self.llm, mock=self.mock, symbol_lib=self.symbol_lib
-        )
+        targets, new_content = _parse_revision(instruction)
+        if not targets or not new_content:
+            self.state["last_revision"] = "没识别出来，试试「把 C1 换成 22uF」或「稳压器换成 AMS1117-5.0」"
+            return False
+
+        items = self.state["bom"]["items"]
+        by_ref = {it["ref"]: it for it in items}
+
+        # 目标 → 具体位号集合
+        hit_refs = []
+        for t in targets:
+            if t in by_ref:                       # 精确位号
+                hit_refs.append(t)
+                continue
+            tl = t.lower()
+            hints = None
+            for kw, prefixes in _TYPE_HINTS.items():
+                if kw.lower() in tl or tl in kw.lower():
+                    hints = prefixes
+                    break
+            if hints:
+                for it in items:
+                    sym = it.get("symbol", "")
+                    if any(sym.startswith(p) for p in hints) and it["ref"] not in hit_refs:
+                        hit_refs.append(it["ref"])
+        if not hit_refs:
+            self.state["last_revision"] = f"找不到元件「{', '.join(targets)}」，当前位号：{', '.join(by_ref)}"
+            return False
+
+        # 新内容：真实型号 → 换 symbol；否则只改 value
+        new_symbol = None
+        if self.symbol_lib is not None and not _VALUE_RE.match(new_content):
+            new_symbol = self.symbol_lib.find_exact_symbol(new_content)
+        clean_value = re.sub(r"\s+", "", new_content)
+
+        changes = []
+        for ref in hit_refs:
+            it = by_ref[ref]
+            old = f'{it.get("value", "")}'
+            it["value"] = clean_value
+            if new_symbol:
+                old_sym = it.get("symbol", "")
+                it["symbol"] = new_symbol
+                changes.append(f"{ref}: {old_sym} → {new_symbol}，{old} → {clean_value}")
+            else:
+                changes.append(f"{ref}: {old} → {clean_value}")
+
+        # 换型号后过滤掉新符号不存在的引脚，保持网表合法
+        nl = self.state.get("netlist")
+        if new_symbol and nl is not None and self.symbol_lib is not None:
+            from .netlist_generator import _self_heal_netlist
+            nl = _self_heal_netlist(nl, self.state["bom"], set(by_ref), self.symbol_lib)
+            self.state["netlist"] = nl
+
+        notes = "；".join(changes)
         self.state["history"].append(instruction)
+        self.state["last_revision"] = notes
         return True
 
     def revise_erc(self, erc_text: str):

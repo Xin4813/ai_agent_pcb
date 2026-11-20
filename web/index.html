@@ -43,6 +43,22 @@
   .err{display:none;margin-top:14px;padding:12px 14px;border-radius:10px;background:#fef2f2;color:#b91c1c;
     border:1px solid #fecaca;font-size:13.5px}
   .err.show{display:block}
+  .revise{margin-top:14px;padding:14px;border:1px solid var(--line);border-radius:12px;background:var(--soft)}
+  .revise .ttl{font-size:13.5px;font-weight:600;color:var(--ink);margin-bottom:9px;display:flex;align-items:center;gap:7px}
+  .revise .hist{font-size:12.5px;color:var(--muted);margin-bottom:9px;max-height:88px;overflow:auto}
+  .revise .hist div{padding:3px 0;border-bottom:1px dashed var(--line)}
+  .revise .hist div:last-child{border-bottom:0}
+  .revise .rrow{display:flex;gap:8px;flex-wrap:wrap}
+  .revise input[type=text]{flex:1;min-width:220px;border:1px solid var(--line);border-radius:9px;padding:9px 12px;
+    font-size:14px;font-family:inherit;color:var(--ink);background:#fff;outline:none}
+  .revise input[type=text]:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(37,99,235,.1)}
+  .revise .rbtn{border:0;background:linear-gradient(135deg,var(--accent),var(--accent2));color:#fff;
+    padding:9px 16px;border-radius:9px;font-size:13.5px;font-weight:600;cursor:pointer}
+  .revise .rbtn:disabled{opacity:.55;cursor:not-allowed}
+  .revise .chips{margin-top:9px}
+  .revise .chip{font-size:11.5px;padding:4px 9px;background:#fff}
+  .revise .rnote{font-size:12.5px;color:var(--ok);margin-top:9px;display:none}
+  .revise .rnote.show{display:block}
   .results{margin-top:22px;display:none}
   .results.show{display:block}
   .meta{display:flex;align-items:center;gap:10px;margin-bottom:14px;flex-wrap:wrap}
@@ -113,6 +129,22 @@
   </div>
 
   <div class="results" id="results">
+    <div class="revise">
+      <div class="ttl">💬 对话式修改 · 更换元件</div>
+      <div class="hist" id="revHist"></div>
+      <div class="rrow">
+        <input type="text" id="revInput" placeholder="例如：把 C1 换成 22uF / 把稳压器换成 AMS1117-5.0 / LED 改成绿色" />
+        <button class="rbtn" id="revBtn">应用修改</button>
+      </div>
+      <div class="chips" id="revChips">
+        <span class="chip">把 C1 换成 22uF</span>
+        <span class="chip">把电容换成 100nF</span>
+        <span class="chip">R3 改成 1k</span>
+        <span class="chip">把稳压器换成 AMS1117-5.0</span>
+        <span class="chip">把 LED 换成绿色</span>
+      </div>
+      <div class="rnote" id="revNote"></div>
+    </div>
     <div class="meta" id="meta"></div>
     <div class="tabs">
       <div class="tab active" data-pane="sch">原理图预览</div>
@@ -143,6 +175,7 @@
 <script>
 const $ = s => document.querySelector(s);
 let zoom = 1;
+let sessionId = null;
 
 function setStatus(show, text){ const s=$('#status'); s.classList.toggle('show', show); if(text) $('#statusText').textContent=text; }
 function showErr(msg){ const e=$('#err'); e.textContent=msg; e.classList.add('show'); }
@@ -151,6 +184,34 @@ function hideErr(){ $('#err').classList.remove('show'); }
 $('#chips').addEventListener('click', e=>{
   if(e.target.classList.contains('chip')){ $('#prompt').value=e.target.textContent.trim(); }
 });
+
+// —— 对话式修改（更换元件）——
+$('#revChips').addEventListener('click', e=>{
+  if(e.target.classList.contains('chip')){ $('#revInput').value=e.target.textContent.trim(); $('#revInput').focus(); }
+});
+function showRevNote(msg, isErr){ const n=$('#revNote'); n.textContent=msg; n.style.color=isErr?'var(--warn)':'var(--ok)'; n.classList.add('show'); }
+function renderHistory(items){
+  const h=$('#revHist');
+  if(!items || items.length<2){ h.innerHTML='<div>还没有修改记录。生成原理图后，可用上方指令更换元件。</div>'; return; }
+  h.innerHTML=items.slice(1).map(x=>'<div>↳ '+escapeHtml(x)+'</div>').join('');
+}
+$('#revBtn').addEventListener('click', async ()=>{
+  const instruction=$('#revInput').value.trim();
+  if(!instruction){ showRevNote('请先输入修改指令', true); return; }
+  if(!sessionId){ showRevNote('请先生成原理图，再进行修改', true); return; }
+  $('#revBtn').disabled=true; $('#revNote').classList.remove('show');
+  try{
+    const resp=await fetch('/api/revise',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({session_id:sessionId, instruction, autofix:$('#autofix').checked})});
+    const data=await resp.json();
+    if(!data.ok){ showRevNote('修改失败：'+(data.error||'未知错误'), true); return; }
+    $('#revInput').value='';
+    showRevNote('✓ '+(data.revision||'已应用修改'), false);
+    render(data);   // 用新结果整体刷新（SVG/BOM/网表/ERC 全部更新）
+  }catch(e){ showRevNote('网络/服务错误：'+e.message, true); }
+  finally{ $('#revBtn').disabled=false; }
+});
+$('#revInput').addEventListener('keydown', e=>{ if(e.key==='Enter'){ $('#revBtn').click(); } });
 
 document.querySelectorAll('.tab').forEach(t=>{
   t.addEventListener('click', ()=>{
@@ -174,6 +235,7 @@ $('#go').addEventListener('click', async ()=>{
   const prompt=$('#prompt').value.trim();
   if(!prompt){ showErr('请先填写设计需求'); return; }
   hideErr(); setStatus(true,'正在调用 AI Agent 设计…（首次约 30–90 秒）');
+  $('#revNote').classList.remove('show'); $('#revInput').value=''; sessionId=null;
   $('#go').disabled=true;
   try{
     const resp=await fetch('/api/design',{method:'POST',headers:{'Content-Type':'application/json'},
@@ -188,6 +250,8 @@ $('#go').addEventListener('click', async ()=>{
 });
 
 function render(d){
+  if(d.session_id) sessionId=d.session_id;
+  renderHistory(d.history);
   // meta badges
   const src=d.source==='LLM'?'<span class="badge llm">数据来源：LLM</span>':'<span class="badge mock">数据来源：离线知识库</span>';
   let ercBadge='';

@@ -17,6 +17,7 @@ import json
 import subprocess
 import re
 import threading
+import uuid
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
@@ -121,34 +122,51 @@ def export_svg(sch_path: Path, cli) -> tuple[str | None, str]:
         return None, f"读取 SVG 失败：{e}"
 
 
-def run_design(prompt: str, mock: bool, autofix: bool, max_fix: int = 2) -> dict:
-    cfg = None if mock else load_config()
-    cli = _kicad_cli(cfg)
+# 会话表：session_id -> ctx（保存 Agent 与渲染所需的全部状态），带锁保护。
+# 网页「追问/更换元件」需要复用同一 Agent（含 BOM/网表/历史），否则每轮都从零开始。
+_SESSIONS: dict[str, dict] = {}
+_SESSIONS_LOCK = threading.Lock()
 
-    agent = Agent(cfg=cfg, mock=mock)
-    bom, netlist, used = agent.design(prompt)
 
+def _new_out_dir() -> Path:
     out_dir = Path(os.environ.get("PCB_WEB_OUT") or (ROOT / "examples" / "output"))
     out_dir.mkdir(parents=True, exist_ok=True)
+    return out_dir
+
+
+def _sym_dir(cfg) -> str:
+    if cfg:
+        try:
+            d = kicad_symbols_dir(cfg)
+            if d.exists():
+                return str(d)
+        except Exception:
+            pass
+    return r"C:/Users/Gray/AppData/Local/Programs/KiCad/8.0/share/kicad/symbols"
+
+
+def _render_and_package(ctx: dict, autofix: bool, max_fix: int = 2) -> dict:
+    """把 ctx 里当前的 BOM/网表 → 原理图 → ERC(可选闭环) → SVG → 结果 JSON。
+
+    首次生成与「追问修订」共用，保证两者输出结构完全一致。
+    """
+    agent = ctx["agent"]
+    bom, netlist, cli = agent.state["bom"], agent.state["netlist"], ctx["cli"]
+    out_dir, sym_dir, name = ctx["out_dir"], ctx["sym_dir"], ctx["name"]
+
     (out_dir / "bom.json").write_text(json.dumps(bom, ensure_ascii=False, indent=2), encoding="utf-8")
     (out_dir / "netlist.json").write_text(json.dumps(netlist, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    if cfg and kicad_symbols_dir(cfg).exists():
-        sym_dir = kicad_symbols_dir(cfg)
-    else:
-        sym_dir = r"C:/Users/Gray/AppData/Local/Programs/KiCad/8.0/share/kicad/symbols"
-
-    name = "".join(c if c.isalnum() else "_" for c in (bom.get("project") or prompt))[:40] or "design"
     sch = write_schematic(netlist, bom, out_dir / "schematic" / f"{name}.kicad_sch", sym_dir)
 
     loop = []
     last_erc = None
-    iters = (max_fix + 1) if (autofix and not mock) else 1
+    iters = (max_fix + 1) if (autofix and not ctx.get("mock")) else 1
     for i in range(iters):
         erc = run_erc(sch, cli)
         last_erc = erc
         loop.append({"iter": i, "erc": erc})
-        if not autofix or mock or i >= max_fix:
+        if not autofix or ctx.get("mock") or i >= max_fix:
             break
         if not erc["ok"] or erc["violations"] is None:
             loop.append({"iter": i, "note": "ERC 不可用，停止闭环"})
@@ -165,17 +183,52 @@ def run_design(prompt: str, mock: bool, autofix: bool, max_fix: int = 2) -> dict
     svg, svg_err = export_svg(sch, cli)
     return {
         "ok": True,
-        "source": "LLM" if used else "离线知识库",
-        "prompt": prompt,
+        "source": "LLM" if ctx.get("used") else "离线知识库",
+        "prompt": ctx["prompt"],
         "bom": bom,
-        "netlist": netlist,
+        "netlist": agent.state["netlist"],
         "sch": str(sch),
         "svg": svg,
         "svg_error": svg_err,
         "erc": last_erc,
         "loop": loop,
         "kicad_cli": cli or "",
+        "session_id": ctx["sid"],
+        "last_revision": agent.state.get("last_revision", ""),
+        "history": list(agent.state.get("history", [])),
     }
+
+
+def run_design(prompt: str, mock: bool, autofix: bool, max_fix: int = 2) -> dict:
+    cfg = None if mock else load_config()
+    cli = _kicad_cli(cfg)
+    agent = Agent(cfg=cfg, mock=mock)
+    bom, netlist, used = agent.design(prompt)
+
+    out_dir = _new_out_dir()
+    name = "".join(c if c.isalnum() else "_" for c in (bom.get("project") or prompt))[:40] or "design"
+    sid = uuid.uuid4().hex
+    ctx = {"sid": sid, "agent": agent, "cfg": cfg, "cli": cli, "out_dir": out_dir,
+           "sym_dir": _sym_dir(cfg), "name": name, "prompt": prompt, "mock": mock, "used": used}
+    with _SESSIONS_LOCK:
+        _SESSIONS[sid] = ctx
+    return _render_and_package(ctx, autofix, max_fix)
+
+
+def revise_design(session_id: str, instruction: str, autofix: bool, max_fix: int = 2) -> dict:
+    """在已有会话上按自然语言指令更换元件，重画并重新检查。"""
+    with _SESSIONS_LOCK:
+        ctx = _SESSIONS.get(session_id)
+    if ctx is None:
+        return {"ok": False, "error": "会话已失效，请重新生成原理图后再修改"}
+    agent = ctx["agent"]
+    ok = agent.revise(instruction)
+    if not ok:
+        return {"ok": False, "error": agent.state.get("last_revision", "无法识别该修改指令")}
+    result = _render_and_package(ctx, autofix, max_fix)
+    result["revision"] = agent.state.get("last_revision", "")
+    result["instruction"] = instruction
+    return result
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -200,8 +253,26 @@ class Handler(BaseHTTPRequestHandler):
             return
         self._send(404, b"not found", "text/plain; charset=utf-8")
 
+    @staticmethod
+    def _run_async(fn) -> dict:
+        """在子线程里跑耗时任务，用事件把结果交回（避免阻塞服务器）。"""
+        result = {}
+        ev = threading.Event()
+
+        def worker():
+            try:
+                result["data"] = fn()
+            except Exception as e:  # noqa: BLE001
+                result["data"] = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+            ev.set()
+
+        threading.Thread(target=worker, daemon=True).start()
+        ev.wait(timeout=600)
+        return result.get("data", {"ok": False, "error": "处理超时（>600s）"})
+
     def do_POST(self):
-        if urlparse(self.path).path != "/api/design":
+        path = urlparse(self.path).path
+        if path not in ("/api/design", "/api/revise"):
             self._send(404, json.dumps({"ok": False, "error": "unknown endpoint"}).encode("utf-8"))
             return
         try:
@@ -212,29 +283,22 @@ class Handler(BaseHTTPRequestHandler):
             self._send(400, json.dumps({"ok": False, "error": f"请求解析失败: {e}"}).encode("utf-8"))
             return
 
-        prompt = (data.get("prompt") or "").strip()
-        mock = bool(data.get("mock", False))
         autofix = bool(data.get("autofix", True))
-        if not prompt:
-            self._send(400, json.dumps({"ok": False, "error": "需求不能为空"}).encode("utf-8"))
-            return
-
-        # 在子线程里跑（避免阻塞服务器），用事件把结果交回。
-        result = {}
-        ev = threading.Event()
-
-        def worker():
-            try:
-                result["data"] = run_design(prompt, mock, autofix)
-            except Exception as e:  # noqa: BLE001
-                result["data"] = {"ok": False, "error": f"{type(e).__name__}: {e}"}
-            ev.set()
-
-        threading.Thread(target=worker, daemon=True).start()
-        ev.wait(timeout=600)
-        if "data" not in result:
-            result["data"] = {"ok": False, "error": "处理超时（>600s）"}
-        self._send(200, json.dumps(result["data"], ensure_ascii=False).encode("utf-8"))
+        if path == "/api/design":
+            prompt = (data.get("prompt") or "").strip()
+            mock = bool(data.get("mock", False))
+            if not prompt:
+                self._send(400, json.dumps({"ok": False, "error": "需求不能为空"}).encode("utf-8"))
+                return
+            out = self._run_async(lambda: run_design(prompt, mock, autofix))
+        else:  # /api/revise
+            sid = (data.get("session_id") or "").strip()
+            instruction = (data.get("instruction") or "").strip()
+            if not sid or not instruction:
+                self._send(400, json.dumps({"ok": False, "error": "缺少 session_id 或修改指令"}).encode("utf-8"))
+                return
+            out = self._run_async(lambda: revise_design(sid, instruction, autofix))
+        self._send(200, json.dumps(out, ensure_ascii=False).encode("utf-8"))
 
 
 def main():
