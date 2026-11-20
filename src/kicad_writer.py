@@ -23,7 +23,7 @@ from __future__ import annotations
 import json
 import re
 import uuid
-from collections import deque
+import heapq
 from pathlib import Path
 from .symbol_lib import SymbolLib
 
@@ -109,10 +109,10 @@ def _mst_edges(points: list[tuple[int, int]]) -> list[tuple[int, int]]:
 
 
 def _route_path(start, goal, blocked, owner, key, nx, ny):
-    """在空闲栅格上用 BFS 找一条正交路径；不同网络的已有走线视为障碍。
+    """在空闲栅格上找一条「少拐弯」的正交路径。
 
-    返回栅格节点列表（含起终点），失败返回 None。路径只走横线/竖线，
-    并压缩成尽可能少的线段后再写入 KiCad。
+    用 Dijkstra 给每次转向加惩罚，避免最短但锯齿状的走线；不同网络已有
+    走线视为障碍。返回栅格节点列表（含起终点），失败返回 None。
     """
     if start == goal:
         return [start]
@@ -123,29 +123,39 @@ def _route_path(start, goal, blocked, owner, key, nx, ny):
         owners = owner.get(node)
         if owners and key in owners:      # 本网已有的线/端点可复用
             return True
-        if node in blocked:               # 符号本体或电源旗标
+        if node in blocked:               # 符号本体
             return False
         return not owners                 # 其他网络的走线不可穿越
 
-    q = deque([start])
-    prev = {start: None}
     dirs = ((1, 0), (-1, 0), (0, 1), (0, -1))
-    while q:
-        cur = q.popleft()
-        if cur == goal:
+    init = (start[0], start[1], -1)
+    dist = {init: 0}
+    prev = {}
+    heap = [(0, init)]
+    while heap:
+        cost, state = heapq.heappop(heap)
+        if cost != dist.get(state):
+            continue
+        x, y, direction = state
+        if (x, y) == goal:
             path = []
+            cur = state
             while cur is not None:
-                path.append(cur)
-                cur = prev[cur]
+                path.append((cur[0], cur[1]))
+                cur = prev.get(cur)
             return path[::-1]
-        for dx, dy in dirs:
-            nxt = (cur[0] + dx, cur[1] + dy)
+        for nd, (dx, dy) in enumerate(dirs):
+            nxt = (x + dx, y + dy)
             if not (1 <= nxt[0] < nx - 1 and 1 <= nxt[1] < ny - 1):
                 continue
-            if nxt in prev or not free(nxt):
+            if not free(nxt):
                 continue
-            prev[nxt] = cur
-            q.append(nxt)
+            nstate = (nxt[0], nxt[1], nd)
+            ncost = cost + 1 + (0 if direction in (-1, nd) else 4)
+            if ncost < dist.get(nstate, 10 ** 9):
+                dist[nstate] = ncost
+                prev[nstate] = state
+                heapq.heappush(heap, (ncost, nstate))
     return None
 
 
@@ -205,14 +215,14 @@ def _compress_segments(path):
     return segs
 
 
-def _layout(items, lib) -> tuple[dict, str]:
-    """逐列紧凑排布（按高度降序装箱），返回 ({ref: (x, y)}, 纸张规格)。
+def _layout(items, lib, netlist=None, alias=None) -> tuple[dict, str]:
+    """按连接关系布局，返回 ({ref: (x, y)}, 纸张规格)。
 
-    - 每个元件占一个 (2×半宽, 2×半高+间距) 的格子，半宽/半高由引脚包围盒决定；
-    - 在一列内自上而下堆叠，列满则开新列；A4 装不下自动换 A3；
-    - 坐标对齐 1.27 栅格，保证所有引脚/线端点落在 KiCad 栅格上。
+    旧版只按元件高度逐列装箱，结果同一网络的元件被隔得很远，走线像迷宫。
+    现在以引脚最多的芯片为锚点，按「与小网络共享端点」的亲密度依次把相关
+    元件放到邻居周围，从源头缩短走线；A4 放不下再升 A3。
     """
-    cells = []
+    cells = {}
     for it in items:
         try:
             pins = lib.get_pins(it["symbol"])
@@ -223,39 +233,101 @@ def _layout(items, lib) -> tuple[dict, str]:
             my = max(abs(p[1]) for p in pins.values())
         else:
             mx = my = 5.0
-        # 高度降序：大元件（如 MCU）先放，装箱更紧凑
-        cells.append((it["ref"], mx + MARGIN, my + MARGIN))
-    cells.sort(key=lambda c: -c[2])
+        cells[it["ref"]] = (mx + MARGIN, my + MARGIN)
+
+    # 小网络优先：两个元件只在 R1/C1/SW1 这种 3 节点网里相连，比在 VCC/GND
+    # 这种十几节点网里相连更能说明它们应该挨在一起。
+    nets = []
+    if netlist:
+        for net in netlist.get("nets", []):
+            members = set()
+            for pinref in net.get("pins", []):
+                ref = str(pinref).partition(":")[0]
+                ref = alias.get(ref, ref) if alias else ref
+                if ref in cells:
+                    members.add(ref)
+            if len(members) >= 2:
+                nets.append(members)
+
+    def affinity(a, b) -> float:
+        return sum(1.0 / max(1, len(m) - 1) for m in nets if a in m and b in m)
 
     for paper in ("A4", "A3"):
         pw, ph = PAPERS[paper]
-        usable_w, usable_h = pw - 2 * PAGE_MX, ph - 2 * PAGE_MY
-        positions = {}
-        x_left = 0.0            # 当前列左边界（相对页边距）
-        col_w = 0.0             # 当前列最大格宽
-        y = 0.0                 # 当前列已用高度
-        overflow = False
-        for ref, hw, hh in cells:
-            ch = 2 * hh + CELL_GAP
-            if y + ch > usable_h and y > 0:     # 当前列放不下 → 开新列
-                x_left += col_w + CELL_GAP
-                y, col_w = 0.0, 0.0
-            if 2 * hw > usable_w:               # 单元件超页宽（极端情况）
-                overflow = True
-            positions[ref] = (_snap(PAGE_MX + x_left + col_w / 2 + hw),
-                              _snap(PAGE_MY + y + hh))
-            y += ch
-            col_w = max(col_w, 2 * hw)
-        if not overflow and x_left + col_w <= usable_w:
+        positions, boxes = {}, {}
+        anchor = max(cells, key=lambda r: (cells[r][0] * cells[r][1], r))
+        remaining = set(cells) - {anchor}
+        ahw, ahh = cells[anchor]
+        positions[anchor] = (_snap(PAGE_MX + ahw + 12),
+                             _snap(PAGE_MY + ahh + 10))
+        boxes[anchor] = (*positions[anchor], ahw, ahh)
+
+        placed_ok = True
+        while remaining:
+            # 先放主芯片的直接外围，再放二级外围；否则 USB 这类二级模块会
+            # 先占满主芯片右侧，把晶振/复位等本应贴近 MCU 的元件挤到远处。
+            best = max(sorted(remaining),
+                       key=lambda r: (affinity(r, anchor),
+                                      sum(affinity(r, p) for p in boxes), r))
+            hw, hh = cells[best]
+            neighbors = sorted(boxes, key=lambda p: (-affinity(best, p), p))
+
+            def overlap(cx, cy):
+                return any(abs(cx - ox) < hw + ohw + 3
+                           and abs(cy - oy) < hh + ohh + 3
+                           for ox, oy, ohw, ohh in boxes.values())
+
+            def cost(cx, cy):
+                return sum(affinity(best, p) *
+                           (abs(cx - boxes[p][0]) + abs(cy - boxes[p][1]))
+                           for p in neighbors[:6])
+
+            candidates = []
+            for nb in neighbors[:6]:
+                bx, by, bhw, bhh = boxes[nb]
+                dx, dy = bhw + hw + 6, bhh + hh + 6
+                for ox, oy in ((dx, 0), (0, dy), (-dx, 0), (0, -dy),
+                               (dx, dy), (-dx, dy), (dx, -dy), (-dx, -dy)):
+                    if affinity(best, nb) <= 0 and (ox, oy) not in ((dx, 0), (0, dy)):
+                        continue
+                    cx, cy = _snap(bx + ox), _snap(by + oy)
+                    if (cx - hw < PAGE_MX or cx + hw > pw - PAGE_MX
+                            or cy - hh < PAGE_MY or cy + hh > ph - PAGE_MY):
+                        continue
+                    if overlap(cx, cy):
+                        continue
+                    candidates.append((cost(cx, cy), cx, cy))
+
+            if not candidates:
+                # 兜底：粗网格扫描第一个不重叠的位置
+                step = GRID * 4
+                cx0 = _snap(PAGE_MX + hw)
+                cy0 = _snap(PAGE_MY + hh)
+                for cy in range(int(cy0), int(ph - PAGE_MY - hh) + 1, int(step)):
+                    for cx in range(int(cx0), int(pw - PAGE_MX - hw) + 1, int(step)):
+                        if not overlap(cx, cy):
+                            candidates.append((cost(cx, cy), cx, cy))
+                            break
+                    if candidates:
+                        break
+            if not candidates:
+                placed_ok = False
+                break
+            _, cx, cy = min(candidates)
+            positions[best] = (cx, cy)
+            boxes[best] = (cx, cy, hw, hh)
+            remaining.remove(best)
+
+        if placed_ok:
             return positions, paper
-    # A3 仍装不下（几乎不可能）：放宽为不检查，直接用 A3 结果
+    # 极端情况：A3 仍放不下，返回最后一次结果（至少不会崩）
     return positions, "A3"
 
 
 def write_schematic(netlist: dict, bom: dict, output_path, symbols_dir) -> Path:
     lib = SymbolLib(symbols_dir)
     items, alias = _expand_refs(bom["items"])
-    positions, paper = _layout(items, lib)
+    positions, paper = _layout(items, lib, netlist, alias)
     pin_cache = {}
     etype_cache = {}   # ref -> {引脚号: 电气类型(power_in/power_out/...)}
     for it in items:
@@ -433,6 +505,7 @@ def write_schematic(netlist: dict, bom: dict, output_path, symbols_dir) -> Path:
     # 方向要点：pin 的 angle 指向符号体，引出线走外侧（反向）；Y 轴要翻转。
     # 过去只有「短线 + 同名标签」，电气上连通但视觉上没连起来；现在额外用
     # 1.27mm 栅格上的正交走线把同一网络的所有端点真正连成一张网。
+    pw, ph = PAPERS[paper]
     emitted = set()
     net_jobs = []
     flag_no = 0
@@ -476,11 +549,11 @@ def write_schematic(netlist: dict, bom: dict, output_path, symbols_dir) -> Path:
             flag_no += 1
             flag = (fx, fy, f"#FLG{flag_no:02d}")
 
-        net_jobs.append({"name": name, "ends": ends, "flag": flag})
+        net_jobs.append({"name": name, "ends": ends, "flag": flag,
+                         "touched": set()})
 
-    # ③ 障碍物：元件符号本体（引脚包围盒 + 2.54mm，比布局占位盒小，
+    # ④ 障碍物：元件符号本体（引脚包围盒 + 2.54mm，比布局占位盒小，
     #    保证引出线端点仍在障碍外）。PWR_FLAG 由 owner 表避免被其他网络穿越。
-    pw, ph = PAPERS[paper]
     nx, ny = int(pw / GRID) + 1, int(ph / GRID) + 1
     blocked = set()
     for it in items:
@@ -507,34 +580,47 @@ def write_schematic(netlist: dict, bom: dict, output_path, symbols_dir) -> Path:
         if job["flag"]:
             owner.setdefault(_to_grid(job["flag"][0], job["flag"][1]), set()).add(key)
 
-    # ⑤ 短网先走，减少长网被零碎走线挡住的概率。
+    # ⑤ 电源/地先走边缘母线，其余短网先走，减少长网被零碎走线挡住的概率。
     def _cost(job):
         pts = [_to_grid(e[2], e[3]) for e in job["ends"]]
         total = sum(abs(pts[a][0] - pts[b][0]) + abs(pts[a][1] - pts[b][1])
                     for a, b in _mst_edges(pts))
         return (len(pts), total)
 
-    for key, job in sorted(enumerate(net_jobs), key=lambda kv: _cost(kv[1])):
-        pts = [_to_grid(e[2], e[3]) for e in job["ends"]]
-        if job["flag"]:
-            pts.append(_to_grid(job["flag"][0], job["flag"][1]))
+    def _commit(key, path):
+        path = _shorten_path(path, blocked, owner, key)
+        for node in path:
+            owner.setdefault(node, set()).add(key)
+        for (x1, y1), (x2, y2) in _compress_segments(path):
+            if (x1, y1) != (x2, y2):
+                _wire(x1, y1, x2, y2)
+
+    def _mst_route(key, job, pts):
         for a, b in _mst_edges(pts):
             path = _route_path(pts[a], pts[b], blocked, owner, key, nx, ny)
             if not path:
                 continue                       # 走不通时仍保留网络标签兜底
-            path = _shorten_path(path, blocked, owner, key)
-            for node in path:
-                owner.setdefault(node, set()).add(key)
-            for (x1, y1), (x2, y2) in _compress_segments(path):
-                if (x1, y1) != (x2, y2):
-                    _wire(x1, y1, x2, y2)
+            job["touched"].update((a, b))
+            _commit(key, path)
 
-    # ⑥ 输出引出线、标签和 PWR_FLAG（标签保留，便于读图且走线失败时仍连通）。
+    for key, job in sorted(enumerate(net_jobs), key=lambda kv: _cost(kv[1])):
+        pts = [_to_grid(e[2], e[3]) for e in job["ends"]]
+        if job["flag"]:
+            pts.append(_to_grid(job["flag"][0], job["flag"][1]))
+        _mst_route(key, job, pts)
+
+    # ⑥ 输出引出线、标签和 PWR_FLAG。
+    # 已用导线连通的网络只挂一个标签；未接通的端点保留标签兜底。
     for job in net_jobs:
         name = job["name"]
         for ax, ay, ex, ey, odx, ody in job["ends"]:
             _wire(ax, ay, ex, ey)
-            langle = 180 if odx > 0 else 0      # 外侧朝左时标签转 180°，可读性更好
+        touched = sorted(job["touched"])
+        primary = touched[0] if touched else 0
+        for i, (ax, ay, ex, ey, odx, ody) in enumerate(job["ends"]):
+            if i != primary and i in job["touched"]:
+                continue
+            langle = 180 if odx > 0 else 0
             L.append(f'  (label "{name}"')
             L.append(f"    (at {_fmt(ex)} {_fmt(ey)} {langle})")
             L.append('    (effects (font (size 1.27 1.27)))')
