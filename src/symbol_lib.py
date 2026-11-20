@@ -218,6 +218,48 @@ class SymbolLib:
     def pin_numbers(self, lib_id: str):
         return sorted(self.get_pins(lib_id).keys())
 
+    def pin_electrical_types(self, lib_id: str) -> dict:
+        """返回 {引脚号(int): 电气类型(str)}，如 power_in / power_out / input / output /
+        bidirectional / passive / no_connect。
+
+        电气类型是 KiCad pin 节点的第二个 token，例如
+        `(pin power_out line (at ...) (name "VO") (number "2"))` 中的 `power_out`。
+        供原理图生成器智能放置 PWR_FLAG：只在「含 power_in 且不含 power_out」的
+        网络上补旗标，避免与稳压器输出等电源输出脚相撞。
+        """
+        types = {}
+        for node in self._resolve_chain(lib_id):
+            for pin_node in _collect_pins(node):
+                num = _find_sub(pin_node, "number")
+                if num is None or len(pin_node) < 2:
+                    continue
+                try:
+                    n = int(num[1].strip('"'))
+                except (ValueError, IndexError):
+                    continue
+                etype = pin_node[1] if isinstance(pin_node[1], str) else "passive"
+                types[n] = etype
+        return types
+
+    def find_exact_symbol(self, text: str) -> str | None:
+        """按元件名称/型号在符号库里精确查找真实 lib_id。
+
+        把 text 与每个符号名都规整为「仅字母数字小写」后比较，完全相等才命中。
+        用于纠正「name 写对型号、symbol 却填了别的真实符号」的情况，例如
+        name="ESP32-WROOM-32" 但 symbol="...ATmega328P-P" → 命中
+        "RF_Module:ESP32-WROOM-32"。因为要求完全相等，像「10uF」「电容」
+        这类通用值不会误命中具体芯片符号。
+        """
+        text = (text or "").strip()
+        norm = re.sub(r"[^a-z0-9]", "", text.lower())
+        if len(norm) < 4:            # 太短（如 R、C、10K）不足以唯一确定型号
+            return None
+        for s in self.list_symbols():
+            _, _, sn = s.partition(":")
+            if re.sub(r"[^a-z0-9]", "", sn.lower()) == norm:
+                return s
+        return None
+
     def pin_names(self, lib_id: str) -> dict:
         """返回 {引脚号(int): 引脚名(str)}。引脚名来自 pin 节点内的 (name "...") 子节点。
 

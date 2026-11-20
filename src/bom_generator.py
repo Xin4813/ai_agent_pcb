@@ -123,6 +123,57 @@ def _expand_bom_refs(bom: dict) -> dict:
     return bom
 
 
+def _norm_model(s: str) -> str:
+    """型号归一化：仅保留字母数字小写，用于比较 name/value 与符号名是否同一型号。"""
+    return re.sub(r"[^a-z0-9]", "", (s or "").lower())
+
+
+def _reconcile_name_symbol(bom: dict, symbol_lib) -> list:
+    """纠正「name/value 写对了型号，symbol 却配了别的真实符号」的错配。
+
+    典型案例：用户要 ESP32，LLM 输出 name="ESP32-WROOM-32" 但
+    symbol="MCU_Microchip_ATmega:ATmega328P-P"。由于 ATmega328P 是真实存在的
+    符号，仅校验「符号是否存在」的 _check_symbols 会放行，最终画出 Arduino 芯片。
+
+    这里对每个元件：
+      1) 取 name / value 作为型号线索，用 find_exact_symbol 精确查真实 lib_id；
+      2) 若命中，且命中符号的型号归一化名与当前 symbol 的型号名不同
+         （排除封装后缀差异），并且当前 symbol 的引脚与命中符号明显不是同一器件
+         （引脚数不同，或同名符号家族不同），则替换。
+    只在证据充分时替换，避免把「10uF」「电容」这类通用值误当成型号。
+    """
+    if symbol_lib is None:
+        return []
+    notes = []
+    for it in bom["items"]:
+        cur = it.get("symbol", "")
+        cur_name = cur.partition(":")[2]
+        for field in ("name", "value"):
+            clue = str(it.get(field, "") or "").strip()
+            hit = symbol_lib.find_exact_symbol(clue)
+            if not hit:
+                continue
+            hit_name = hit.partition(":")[2]
+            # 型号归一化后相同（含封装后缀，如 ATmega328P-P vs -AU）→ 视为同一器件，不动
+            if _norm_model(hit_name) == _norm_model(cur_name):
+                continue
+            # 证据强化：当前符号的引脚数与命中符号差异大，说明确实是不同器件，
+            # 而不是同一芯片的不同命名/封装。引脚数相近时保守不动，避免误伤。
+            try:
+                cur_pins = set(symbol_lib.get_pins(cur).keys())
+                hit_pins = set(symbol_lib.get_pins(hit).keys())
+            except Exception:
+                cur_pins = hit_pins = set()
+            if cur_pins and hit_pins and cur_pins != hit_pins \
+                    and abs(len(cur_pins) - len(hit_pins)) < 3:
+                # 引脚数接近但集合不同，可能是同系列不同封装，保守不动
+                continue
+            it["symbol"] = hit
+            notes.append(f"{cur} 与元件名 {clue!r} 不符，已按型号改用真实符号 {hit}")
+            break
+    return notes
+
+
 def _check_symbols(bom: dict, symbol_lib) -> list:
     """校验 BOM 中每个 symbol 是否在 KiCad 符号库里真实存在。
 
@@ -179,8 +230,9 @@ def generate_bom(prompt: str, llm=None, mock: bool = False, max_retries: int = 3
             validate_bom(bom)
             if symbol_lib is not None:
                 notes = _check_symbols(bom, symbol_lib)
+                notes += _reconcile_name_symbol(bom, symbol_lib)
                 if notes:
-                    # 已自动把不存在的 symbol 改写为真实符号，BOM 合法，直接接受返回
+                    # 已自动纠错（不存在的符号 / 与型号不符的符号），BOM 现合法，直接返回
                     return bom, True
             return bom, True
         except Exception as e:

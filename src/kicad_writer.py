@@ -127,12 +127,17 @@ def write_schematic(netlist: dict, bom: dict, output_path, symbols_dir) -> Path:
     items, alias = _expand_refs(bom["items"])
     positions, paper = _layout(items, lib)
     pin_cache = {}
+    etype_cache = {}   # ref -> {引脚号: 电气类型(power_in/power_out/...)}
     for it in items:
         try:
             pins = lib.get_pins(it["symbol"])
         except Exception:
             pins = {}
         pin_cache[it["ref"]] = (it["symbol"], pins)
+        try:
+            etype_cache[it["ref"]] = lib.pin_electrical_types(it["symbol"])
+        except Exception:
+            etype_cache[it["ref"]] = {}
 
     # 每个符号的占位包围盒 (x, y, 半宽, 半高)，供 PWR_FLAG 放置避让
     boxes = []
@@ -179,10 +184,30 @@ def write_schematic(netlist: dict, bom: dict, output_path, symbols_dir) -> Path:
         if len(ok) >= 2:
             connected.update(ok)
 
-    # 需要补 PWR_FLAG 的电源网络（每网 1 个）
-    power_nets = [n for n in netlist["nets"]
-                  if _POWER_RE.match(n.get("name", ""))
-                  and len(_net_valid_pins(n)) >= 2]
+    def _net_needs_flag(net) -> bool:
+        """该网络是否需要补 PWR_FLAG（电源输出旗标）。
+
+        判定依据引脚的**电气类型**而非网络名——这是修复 ERC 两条顽固违规的关键：
+          • 只有当网络含 power_in 引脚、且不含任何 power_out 引脚时才需要旗标。
+          • 若网络里已有 power_out（如稳压器 VO、USB 电源输出），再补旗标会触发
+            ERC `[pin_to_pin] 电源输出与电源输出相连`（曾发生在 VCC 网上）。
+          • 若网络含 power_in 但名字不像电源（如稳压器 VI 所在的 NET25），
+            过去按网络名判定会漏补，触发 `[power_pin_not_driven]`。
+
+        没有电气类型信息时（符号库缺失）退回按网络名判定，保持旧行为。
+        """
+        valid = _net_valid_pins(net)
+        if len(valid) < 2:
+            return False
+        kinds = set()
+        for r, key in valid:
+            kinds.add(etype_cache.get(r, {}).get(key, ""))
+        if not any(k for k in kinds if k):        # 无任何电气类型信息 → 退回网络名规则
+            return bool(_POWER_RE.match(net.get("name", "")))
+        return "power_in" in kinds and "power_out" not in kinds
+
+    # 需要补 PWR_FLAG 的电源网络（每网 1 个），按电气类型判定
+    power_nets = [n for n in netlist["nets"] if _net_needs_flag(n)]
 
     L = []
     L.append("(kicad_sch")
@@ -278,7 +303,7 @@ def write_schematic(netlist: dict, bom: dict, output_path, symbols_dir) -> Path:
         if len(ok) < 2:                           # 单引脚网络 → 引脚打 no_connect
             continue
         name = net.get("name", "")
-        is_power = bool(_POWER_RE.match(name))
+        need_flag = _net_needs_flag(net)
         flag_done = False
 
         # ① 收集该网络所有引出线端点（同坐标去重）
@@ -327,10 +352,12 @@ def write_schematic(netlist: dict, bom: dict, output_path, symbols_dir) -> Path:
         # ③ 输出引出线、互连线、标签、PWR_FLAG
         for idx, (ax, ay, ex, ey, odx, ody) in enumerate(ends):
             _wire(ax, ay, ex, ey)
-            if is_power and not flag_done:
-                # 电源网络：在第一条引出线末端补 PWR_FLAG（电源输出，消
-                # 「输入电源引脚不受任何输出电源引脚驱动」）。标签省略，
-                # 网络名由其余引脚的标签提供。放置方向带碰撞检测：
+            if need_flag and not flag_done:
+                # 含 power_in 且无 power_out 的网络：在第一条引出线末端补 PWR_FLAG
+                # （电源输出，消「输入电源引脚不受任何输出电源引脚驱动」）。
+                # 判定按引脚电气类型而非网络名，避免与稳压器 VO 等电源输出相撞、
+                # 也覆盖 NET25 这类名字不像电源但确实含 power_in 的网络。
+                # 标签省略，网络名由其余引脚的标签提供。放置方向带碰撞检测：
                 # 依次尝试上方/下方/外侧，选中不压任何符号包围盒的位置。
                 flag_no += 1
                 cands = [(0.0, -12.7), (0.0, 12.7),
@@ -358,18 +385,40 @@ def write_schematic(netlist: dict, bom: dict, output_path, symbols_dir) -> Path:
         for i, j in links:
             _wire(ends[i][2], ends[i][3], ends[j][2], ends[j][3])
 
-    # 未接入任何网络的引脚打 no_connect（KiCad 规范的「故意悬空」标记）
+    # 未接入任何网络的引脚打 no_connect（KiCad 规范的「故意悬空」标记）。
+    # 两个必须避开的坑（ESP32 这类多 GND 脚芯片上踩过）：
+    #  ① 电气类型本身就是 no_connect 的引脚（如 32 脚 NC）：库已声明，再打标记反
+    #     而触发 no_connect_dangling / no_connect_connected。
+    #  ② 多个引脚共用同一坐标（ESP32 的 1/15/38/39 脚都在 (0,-35.56)）：只要其中
+    #     任意一个接入了网络，整个坐标都不能打 no_connect，否则同点既接线又打标，
+    #     ERC 报 no_connect_connected；反之未接坐标也只打一次，不重复叠加。
+    connected_xy = set()
     for it in items:
         ref = it["ref"]
         _, pins = pin_cache[ref]
         ix, iy = positions[ref]
         for n, (px, py, _a) in pins.items():
-            if (ref, n) not in connected:
-                ax, ay = ix + px, iy - py
-                L.append("  (no_connect")
-                L.append(f"    (at {_fmt(ax)} {_fmt(ay)})")
-                L.append(f'    (uuid "{_u()}")')
-                L.append("  )")
+            if (ref, n) in connected:
+                connected_xy.add((round(ix + px, 3), round(iy - py, 3)))
+    nc_xy = set()
+    for it in items:
+        ref = it["ref"]
+        _, pins = pin_cache[ref]
+        ix, iy = positions[ref]
+        for n, (px, py, _a) in pins.items():
+            if (ref, n) in connected:
+                continue
+            if etype_cache.get(ref, {}).get(n) == "no_connect":   # 坑①
+                continue
+            ax, ay = ix + px, iy - py
+            key = (round(ax, 3), round(ay, 3))
+            if key in connected_xy or key in nc_xy:              # 坑②
+                continue
+            nc_xy.add(key)
+            L.append("  (no_connect")
+            L.append(f"    (at {_fmt(ax)} {_fmt(ay)})")
+            L.append(f'    (uuid "{_u()}")')
+            L.append("  )")
 
     L.append(")")
     out = Path(output_path)
