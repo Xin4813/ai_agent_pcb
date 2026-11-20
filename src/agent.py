@@ -6,6 +6,7 @@ from .bom_generator import generate_bom
 from .netlist_generator import generate_netlist
 from .config import kicad_symbols_dir
 from .symbol_lib import SymbolLib
+from .safety import check_electrical
 
 # 元件类型词 → 候选 symbol 前缀/名（用于「把电容换成…」这类按类型批量修改）
 _TYPE_HINTS = {
@@ -125,7 +126,7 @@ class Agent:
                     break
             except Exception:
                 self.symbol_lib = None
-        self.state = {"bom": None, "netlist": None, "history": []}
+        self.state = {"bom": None, "netlist": None, "history": [], "warnings": []}
 
     def design(self, prompt: str):
         """步骤②③④：需求 → BOM → 网表。返回 (bom, netlist, used_llm)。"""
@@ -135,7 +136,15 @@ class Agent:
         self.state["netlist"] = netlist
         self.state["prompt"] = prompt
         self.state["history"].append(prompt)
+        self._refresh_warnings()
         return bom, netlist, used
+
+    def _refresh_warnings(self, extra: list[str] | None = None):
+        """重算电气安全警告（ERC 不做电气参数检查，这里补一层启发式）。"""
+        w = check_electrical(self.state.get("bom"), self.state.get("netlist"))
+        if extra:
+            w = extra + w
+        self.state["warnings"] = w
 
     def revise(self, instruction: str) -> bool:
         """步骤⑤：按自然语言指令更换元件（改标称值或型号），并重算网表。
@@ -217,17 +226,32 @@ class Agent:
             return False
 
         # 换型号后过滤掉新符号不存在的引脚，保持网表合法
+        dropped: list[str] = []
         nl = self.state.get("netlist")
         if any_symbol_change and nl is not None and self.symbol_lib is not None:
             from .netlist_generator import _self_heal_netlist
-            nl = _self_heal_netlist(nl, self.state["bom"], set(by_ref), self.symbol_lib)
-            self.state["netlist"] = nl
+            before = {p for n in nl.get("nets", []) for p in n.get("pins", [])}
+            healed = _self_heal_netlist(nl, self.state["bom"], set(by_ref), self.symbol_lib)
+            after = {p for n in healed.get("nets", []) for p in n.get("pins", [])}
+            dropped = sorted(before - after)
+            self.state["netlist"] = healed
 
         notes = "；".join(changes)
         if unmatched:
             notes += f"（未找到：{', '.join(unmatched)}）"
         self.state["history"].append(instruction)
         self.state["last_revision"] = notes
+
+        # 电气安全提示：引脚被丢弃 + 电压/极性启发式检查
+        extra = []
+        if dropped:
+            extra.append(
+                f"⚠️ 换型号后已丢弃 {len(dropped)} 条连线（新符号无对应引脚：{', '.join(dropped)}），"
+                f"原电路连接可能已被改变，请人工核对。"
+            )
+            notes += extra[0]
+            self.state["last_revision"] = notes
+        self._refresh_warnings(extra)
         return True
 
     def revise_erc(self, erc_text: str):

@@ -196,6 +196,7 @@ def _render_and_package(ctx: dict, autofix: bool, max_fix: int = 2) -> dict:
         "session_id": ctx["sid"],
         "last_revision": agent.state.get("last_revision", ""),
         "history": list(agent.state.get("history", [])),
+        "warnings": list(agent.state.get("warnings", [])),
     }
 
 
