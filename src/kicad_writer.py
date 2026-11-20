@@ -23,6 +23,7 @@ from __future__ import annotations
 import json
 import re
 import uuid
+from collections import deque
 from pathlib import Path
 from .symbol_lib import SymbolLib
 
@@ -73,6 +74,135 @@ def _expand_refs(items: list) -> tuple[list, dict]:
         else:
             out.append(it)
     return out, alias
+
+
+def _to_grid(x: float, y: float) -> tuple[int, int]:
+    """原理图坐标 → 1.27mm 栅格索引。"""
+    return int(round(x / GRID)), int(round(y / GRID))
+
+
+def _from_grid(i: int, j: int) -> tuple[float, float]:
+    return i * GRID, j * GRID
+
+
+def _mst_edges(points: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    """按曼哈顿距离给端点集合生成最小生成树边（Prim）。"""
+    n = len(points)
+    if n < 2:
+        return []
+    used = {0}
+    edges = []
+    while len(used) < n:
+        best = None
+        for a in used:
+            for b in range(n):
+                if b in used:
+                    continue
+                d = abs(points[a][0] - points[b][0]) + abs(points[a][1] - points[b][1])
+                if best is None or d < best[0]:
+                    best = (d, a, b)
+        if best is None:
+            break
+        edges.append((best[1], best[2]))
+        used.add(best[2])
+    return edges
+
+
+def _route_path(start, goal, blocked, owner, key, nx, ny):
+    """在空闲栅格上用 BFS 找一条正交路径；不同网络的已有走线视为障碍。
+
+    返回栅格节点列表（含起终点），失败返回 None。路径只走横线/竖线，
+    并压缩成尽可能少的线段后再写入 KiCad。
+    """
+    if start == goal:
+        return [start]
+
+    def free(node):
+        if node in (start, goal):
+            return True
+        owners = owner.get(node)
+        if owners and key in owners:      # 本网已有的线/端点可复用
+            return True
+        if node in blocked:               # 符号本体或电源旗标
+            return False
+        return not owners                 # 其他网络的走线不可穿越
+
+    q = deque([start])
+    prev = {start: None}
+    dirs = ((1, 0), (-1, 0), (0, 1), (0, -1))
+    while q:
+        cur = q.popleft()
+        if cur == goal:
+            path = []
+            while cur is not None:
+                path.append(cur)
+                cur = prev[cur]
+            return path[::-1]
+        for dx, dy in dirs:
+            nxt = (cur[0] + dx, cur[1] + dy)
+            if not (1 <= nxt[0] < nx - 1 and 1 <= nxt[1] < ny - 1):
+                continue
+            if nxt in prev or not free(nxt):
+                continue
+            prev[nxt] = cur
+            q.append(nxt)
+    return None
+
+
+def _shorten_path(path, blocked, owner, key):
+    """在仍可通行的前提下合并绕路产生的多余拐角，减少线段数。"""
+    if len(path) <= 2:
+        return path
+
+    def clear(a, b):
+        if a[0] == b[0]:
+            lo, hi = sorted((a[1], b[1]))
+            cells = [(a[0], j) for j in range(lo, hi + 1)]
+        elif a[1] == b[1]:
+            lo, hi = sorted((a[0], b[0]))
+            cells = [(i, a[1]) for i in range(lo, hi + 1)]
+        else:
+            return False
+        for c in cells:
+            if c in (a, b):
+                continue
+            owners = owner.get(c)
+            if owners and key in owners:
+                continue
+            if c in blocked or owners:
+                return False
+        return True
+
+    out = [path[0]]
+    i = 0
+    while i < len(path) - 1:
+        best = i + 1
+        for j in range(len(path) - 1, i + 1, -1):
+            if clear(path[i], path[j]):
+                best = j
+                break
+        out.append(path[best])
+        i = best
+    return out
+
+
+def _compress_segments(path):
+    """把栅格路径压成尽量少的水平/垂直线段（坐标为 mm）。"""
+    pts = [_from_grid(i, j) for i, j in path]
+    if len(pts) < 2:
+        return []
+    segs = []
+    begin = pts[0]
+    direction = None
+    for a, b in zip(pts, pts[1:]):
+        d = (b[0] - a[0], b[1] - a[1])
+        if direction is None:
+            begin, direction = a, d
+        elif d != direction:
+            segs.append((begin, a))
+            begin, direction = a, d
+    segs.append((begin, pts[-1]))
+    return segs
 
 
 def _layout(items, lib) -> tuple[dict, str]:
@@ -290,21 +420,27 @@ def write_schematic(netlist: dict, bom: dict, output_path, symbols_dir) -> Path:
         _, pins = pin_cache[ref]
         _emit_symbol(ref, sym, x, y, pins, it.get("value", ""))
 
-    # 引脚引出线 + 网络标签 + 电源 PWR_FLAG + 未连引脚的 no_connect 标记。
+    def _wire(x1, y1, x2, y2):
+        L.append("  (wire")
+        L.append("    (pts")
+        L.append(f"      (xy {_fmt(x1)} {_fmt(y1)}) (xy {_fmt(x2)} {_fmt(y2)})")
+        L.append("    )")
+        L.append('    (stroke (width 0) (type solid))')
+        L.append(f'    (uuid "{_u()}")')
+        L.append("  )")
+
+    # 引脚引出线 + 网络标签 + 同网导线互连 + PWR_FLAG + 未连引脚 no_connect。
     # 方向要点：pin 的 angle 指向符号体，引出线走外侧（反向）；Y 轴要翻转。
-    # 同一位置 + 同一网络名只发一次：KiCad 官方符号存在同坐标叠放的引脚
-    # （如 ATmega328P 的 8/22 脚都是 GND，定义在同一点），重复发线既冗余又难看。
-    # 同一网络上相距很近的端点（如 7/20 脚都在顶边、仅隔 2.54mm）不用两个
-    # 标签——文字会互相压住——而是用短导线互连、只挂一个标签。
+    # 过去只有「短线 + 同名标签」，电气上连通但视觉上没连起来；现在额外用
+    # 1.27mm 栅格上的正交走线把同一网络的所有端点真正连成一张网。
     emitted = set()
+    net_jobs = []
     flag_no = 0
     for net in netlist["nets"]:
         ok = _net_valid_pins(net)
         if len(ok) < 2:                           # 单引脚网络 → 引脚打 no_connect
             continue
         name = net.get("name", "")
-        need_flag = _net_needs_flag(net)
-        flag_done = False
 
         # ① 收集该网络所有引出线端点（同坐标去重）
         ends = []
@@ -320,70 +456,95 @@ def write_schematic(netlist: dict, bom: dict, output_path, symbols_dir) -> Path:
                 continue
             emitted.add(k)
             ends.append((ax, ay, ex, ey, -dx, dy))
+        if len(ends) < 2:
+            continue
 
-        # ② 同网邻近端点互连（水平同线且间距 ≤15.24mm，且两根引出线同朝上/下；
-        #    垂直同理）。被连接的第二端不再挂标签。
-        merged = set()
-        links = []
-        for i in range(len(ends)):
-            ax, ay, ex, ey, odx, ody = ends[i]
-            for j in range(i + 1, len(ends)):
-                bx, by, fx, fy, pdx, pdy = ends[j]
-                if (ex == ax and fx == bx and ay == by
-                        and 0 < abs(ax - bx) <= 15.24
-                        and (ey - ay) * (fy - by) > 0):
-                    links.append((i, j))
-                    merged.add(j)
-                elif (ey == ay and fy == by and ax == bx
-                        and 0 < abs(ay - by) <= 15.24
-                        and (ex - ax) * (fx - bx) > 0):
-                    links.append((i, j))
-                    merged.add(j)
+        # ② PWR_FLAG 位置（仍按电气类型判定，带符号避让）
+        flag = None
+        if _net_needs_flag(net):
+            ax, ay, ex, ey, odx, ody = ends[0]
+            cands = [(0.0, -12.7), (0.0, 12.7),
+                     (odx * 12.7, ody * 12.7), (-odx * 12.7, -ody * 12.7)]
+            fx = fy = None
+            for ox, oy in cands:
+                tx, ty = _snap(ex + ox), _snap(ey + oy)
+                if not _hits_symbol(tx, ty):
+                    fx, fy = tx, ty
+                    break
+            if fx is None:
+                fx, fy = _snap(ex + odx * 12.7), _snap(ey + ody * 12.7)
+            flag_no += 1
+            flag = (fx, fy, f"#FLG{flag_no:02d}")
 
-        def _wire(x1, y1, x2, y2):
-            L.append("  (wire")
-            L.append("    (pts")
-            L.append(f"      (xy {_fmt(x1)} {_fmt(y1)}) (xy {_fmt(x2)} {_fmt(y2)})")
-            L.append("    )")
-            L.append('    (stroke (width 0) (type solid))')
+        net_jobs.append({"name": name, "ends": ends, "flag": flag})
+
+    # ③ 障碍物：元件符号本体（引脚包围盒 + 2.54mm，比布局占位盒小，
+    #    保证引出线端点仍在障碍外）。PWR_FLAG 由 owner 表避免被其他网络穿越。
+    pw, ph = PAPERS[paper]
+    nx, ny = int(pw / GRID) + 1, int(ph / GRID) + 1
+    blocked = set()
+    for it in items:
+        _, pins = pin_cache[it["ref"]]
+        if not pins:
+            continue
+        ix, iy = positions[it["ref"]]
+        xs = [p[0] for p in pins.values()]
+        ys = [p[1] for p in pins.values()]
+        pad = 2.54
+        x0, x1 = ix + min(xs) - pad, ix + max(xs) + pad
+        y0, y1 = iy - max(ys) - pad, iy - min(ys) + pad
+        i0, j0 = _to_grid(x0, y0)
+        i1, j1 = _to_grid(x1, y1)
+        for gi in range(max(0, i0), min(nx, i1 + 1)):
+            for gj in range(max(0, j0), min(ny, j1 + 1)):
+                blocked.add((gi, gj))
+
+    # ④ 预先登记各网络端点（含 PWR_FLAG），避免别的网络从这些点穿过去。
+    owner = {}
+    for key, job in enumerate(net_jobs):
+        for e in job["ends"]:
+            owner.setdefault(_to_grid(e[2], e[3]), set()).add(key)
+        if job["flag"]:
+            owner.setdefault(_to_grid(job["flag"][0], job["flag"][1]), set()).add(key)
+
+    # ⑤ 短网先走，减少长网被零碎走线挡住的概率。
+    def _cost(job):
+        pts = [_to_grid(e[2], e[3]) for e in job["ends"]]
+        total = sum(abs(pts[a][0] - pts[b][0]) + abs(pts[a][1] - pts[b][1])
+                    for a, b in _mst_edges(pts))
+        return (len(pts), total)
+
+    for key, job in sorted(enumerate(net_jobs), key=lambda kv: _cost(kv[1])):
+        pts = [_to_grid(e[2], e[3]) for e in job["ends"]]
+        if job["flag"]:
+            pts.append(_to_grid(job["flag"][0], job["flag"][1]))
+        for a, b in _mst_edges(pts):
+            path = _route_path(pts[a], pts[b], blocked, owner, key, nx, ny)
+            if not path:
+                continue                       # 走不通时仍保留网络标签兜底
+            path = _shorten_path(path, blocked, owner, key)
+            for node in path:
+                owner.setdefault(node, set()).add(key)
+            for (x1, y1), (x2, y2) in _compress_segments(path):
+                if (x1, y1) != (x2, y2):
+                    _wire(x1, y1, x2, y2)
+
+    # ⑥ 输出引出线、标签和 PWR_FLAG（标签保留，便于读图且走线失败时仍连通）。
+    for job in net_jobs:
+        name = job["name"]
+        for ax, ay, ex, ey, odx, ody in job["ends"]:
+            _wire(ax, ay, ex, ey)
+            langle = 180 if odx > 0 else 0      # 外侧朝左时标签转 180°，可读性更好
+            L.append(f'  (label "{name}"')
+            L.append(f"    (at {_fmt(ex)} {_fmt(ey)} {langle})")
+            L.append('    (effects (font (size 1.27 1.27)))')
             L.append(f'    (uuid "{_u()}")')
             L.append("  )")
-
-        # ③ 输出引出线、互连线、标签、PWR_FLAG
-        for idx, (ax, ay, ex, ey, odx, ody) in enumerate(ends):
-            _wire(ax, ay, ex, ey)
-            if need_flag and not flag_done:
-                # 含 power_in 且无 power_out 的网络：在第一条引出线末端补 PWR_FLAG
-                # （电源输出，消「输入电源引脚不受任何输出电源引脚驱动」）。
-                # 判定按引脚电气类型而非网络名，避免与稳压器 VO 等电源输出相撞、
-                # 也覆盖 NET25 这类名字不像电源但确实含 power_in 的网络。
-                # 标签省略，网络名由其余引脚的标签提供。放置方向带碰撞检测：
-                # 依次尝试上方/下方/外侧，选中不压任何符号包围盒的位置。
-                flag_no += 1
-                cands = [(0.0, -12.7), (0.0, 12.7),
-                         (odx * 12.7, ody * 12.7), (-odx * 12.7, -ody * 12.7)]
-                fx = fy = None
-                for ox, oy in cands:
-                    tx, ty = _snap(ex + ox), _snap(ey + oy)
-                    if not _hits_symbol(tx, ty):
-                        fx, fy = tx, ty
-                        break
-                if fx is None:                      # 全部冲突：退回外侧最远点
-                    fx, fy = _snap(ex + odx * 12.7), _snap(ey + ody * 12.7)
-                _wire(ex, ey, fx, fy)
-                _emit_symbol(f"#FLG{flag_no:02d}", "power:PWR_FLAG", fx, fy,
-                             {1: (0.0, 0.0, 90.0)}, "PWR_FLAG", in_bom="no",
-                             hide_text=True)
-                flag_done = True
-            if idx not in merged:
-                langle = 180 if odx > 0 else 0      # 外侧朝左时标签转 180°，可读性更好
-                L.append(f'  (label "{name}"')
-                L.append(f"    (at {_fmt(ex)} {_fmt(ey)} {langle})")
-                L.append('    (effects (font (size 1.27 1.27)))')
-                L.append(f'    (uuid "{_u()}")')
-                L.append("  )")
-        for i, j in links:
-            _wire(ends[i][2], ends[i][3], ends[j][2], ends[j][3])
+        if job["flag"]:
+            fx, fy, fref = job["flag"]
+            _emit_symbol(fref, "power:PWR_FLAG", fx, fy,
+                         {1: (0.0, 0.0, 90.0)}, "PWR_FLAG", in_bom="no",
+                         hide_text=True)
 
     # 未接入任何网络的引脚打 no_connect（KiCad 规范的「故意悬空」标记）。
     # 两个必须避开的坑（ESP32 这类多 GND 脚芯片上踩过）：
