@@ -55,6 +55,24 @@ def _parse(tokens):
     return parse_expr()
 
 
+def _norm_model_name(s: str) -> str:
+    """把型号规整为仅字母数字小写，用于型号匹配。"""
+    return re.sub(r"[^a-z0-9]", "", (s or "").lower())
+
+
+def _package_alias_match(symbol_norm: str, model_norm: str) -> bool:
+    """判断符号名是否是型号的「封装通配」写法。
+
+    KiCad 常用 x 表示封装/存储容量变体，例如 STM32F103C8Tx 对应
+    STM32F103C8T6/C8T7/C8T8。只允许长度相同、且仅符号侧 x 位置不同。
+    """
+    if len(symbol_norm) != len(model_norm) or not symbol_norm:
+        return False
+    if symbol_norm == model_norm:
+        return True
+    return all(a == b or a == "x" for a, b in zip(symbol_norm, model_norm))
+
+
 def _find_sub(node, key):
     if not isinstance(node, list):
         return None
@@ -242,21 +260,25 @@ class SymbolLib:
         return types
 
     def find_exact_symbol(self, text: str) -> str | None:
-        """按元件名称/型号在符号库里精确查找真实 lib_id。
+        """按元件名称/型号在符号库里查找真实 lib_id。
 
-        把 text 与每个符号名都规整为「仅字母数字小写」后比较，完全相等才命中。
-        用于纠正「name 写对型号、symbol 却填了别的真实符号」的情况，例如
-        name="ESP32-WROOM-32" 但 symbol="...ATmega328P-P" → 命中
-        "RF_Module:ESP32-WROOM-32"。因为要求完全相等，像「10uF」「电容」
-        这类通用值不会误命中具体芯片符号。
+        第一轮完全相等（如 ESP32-WROOM-32）；第二轮允许 KiCad 用 x 表示
+        封装/容量变体（如 STM32F103C8T6 → STM32F103C8Tx）。仍然要求型号
+        足够长，避免「10uF」「电容」这类通用值误命中具体芯片。
         """
-        text = (text or "").strip()
-        norm = re.sub(r"[^a-z0-9]", "", text.lower())
-        if len(norm) < 4:            # 太短（如 R、C、10K）不足以唯一确定型号
+        norm = _norm_model_name(text)
+        if len(norm) < 4:
             return None
-        for s in self.list_symbols():
+        symbols = self.list_symbols()
+        for s in symbols:
             _, _, sn = s.partition(":")
-            if re.sub(r"[^a-z0-9]", "", sn.lower()) == norm:
+            if _norm_model_name(sn) == norm:
+                return s
+        if len(norm) < 6:            # 太短时不要用通配，避免误伤
+            return None
+        for s in symbols:
+            _, _, sn = s.partition(":")
+            if _package_alias_match(_norm_model_name(sn), norm):
                 return s
         return None
 

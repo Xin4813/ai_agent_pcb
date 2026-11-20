@@ -30,7 +30,7 @@ _KEYWORD_RECALL = {
     "发光": "LED", "灯": "LED", "晶振": "Crystal", "振荡": "Crystal", "时钟": "Crystal",
     "按键": "SW_Push", "按钮": "SW_Push", "开关": "SW_", "拨码": "SW_",
     "电池": "Battery", "保险": "Fuse", "熔断": "Fuse",
-    "单片机": "ATmega", "微控制": "MCU", "MCU": "MCU", "处理器": "MCU",
+    "单片机": "MCU_", "微控制": "MCU", "MCU": "MCU", "处理器": "MCU",
     "接插件": "Conn_", "排针": "Conn_", "插座": "Conn_", "端子": "Terminal",
     "传感器": "Sensor", "电机": "Motor", "继电器": "Relay", "晶振": "Oscillator",
     "三极管": "Transistor", "晶体管": "Transistor", "场效应": "FET", "MOS": "FET",
@@ -44,6 +44,8 @@ SYS_BOM = (
     '"qty":数量,"symbol":"KiCad 符号库ID 如 Device:C","footprint":"封装(可空)","desc":"说明(可空)"}]}'
     "\n【硬性要求】symbol 必须是下面“可用符号目录”里真实存在的 lib_id 之一"
     "（必须严格一致，包括库前缀与符号名，不要自己编造或用近似名）："
+    "\n【型号匹配】若需求中的芯片型号没有完全同名符号，必须选同系列最接近的真实符号"
+    "（如 STM32F103C8T6 用 STM32F103C8Tx），禁止用 ATmega/Arduino 等无关芯片占位。"
     "\n\n【位号规则】每个 ref 只能对应一个元件；若有多个同型号元件，必须写成独立条目"
     "（如 C1、C2 两条），绝不要把多个位号塞进同一个 ref 字符串（例如写成 \"C1,C2\"）。"
 )
@@ -80,6 +82,26 @@ def _recall_by_keyword(prompt: str, symbol_lib) -> list:
             for s in (pref or hits)[:6]:
                 if s not in out:
                     out.append(s)
+    # 需求里明确写出的芯片/模块型号（STM32F103C8T6、CH340G 等）优先召回。
+    # 否则模型可能因为目录里只有 ATmega 而把 STM32 画成 Arduino 芯片。
+    for m in re.finditer(r"[A-Za-z][A-Za-z0-9_-]{4,}", prompt):
+        token = m.group(0)
+        norm = _norm_model(token)
+        if len(norm) < 6:
+            continue
+        hit = symbol_lib.find_exact_symbol(token)
+        if hit and hit not in out:
+            out.append(hit)
+        # 同系列候选：优先按完整型号前缀（如 STM32F103）；若型号带具体封装
+        # 后缀导致无前缀命中，再退到前 8 位（如 STM32F103C8T6 → stm32f10）。
+        family = [s for s in sorted(present)
+                  if _norm_model(s.partition(":")[2]).startswith(norm)]
+        if not family:
+            family = [s for s in sorted(present)
+                      if _norm_model(s.partition(":")[2]).startswith(norm[:8])]
+        for s in family[:8]:
+            if s not in out:
+                out.append(s)
     return out
 
 
