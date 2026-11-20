@@ -16,6 +16,7 @@ import os
 import json
 import subprocess
 import re
+import tempfile
 import threading
 import uuid
 from pathlib import Path
@@ -103,23 +104,28 @@ def export_svg(sch_path: Path, cli) -> tuple[str | None, str]:
     """
     if not cli:
         return None, "kicad-cli 不可用"
-    out_dir = sch_path.parent
-    expected = out_dir / (sch_path.stem + ".svg")
-    res = _run([cli, "sch", "export", "svg", "--no-background-color",
-                "--output", str(out_dir), str(sch_path)])
-    if not res["ok"]:
-        return None, "kicad-cli 执行失败：" + (res.get("err") or "未知错误")
-    svg = expected if expected.exists() else None
-    if svg is None:
-        # 兜底：取目录里最近生成的 svg
-        cands = sorted(out_dir.glob("*.svg"), key=lambda p: p.stat().st_mtime, reverse=True)
-        svg = cands[0] if cands else None
-    if svg is None:
-        return None, f"未生成 SVG（输出目录：{out_dir}；kicad 报错：{(res.get('err') or '')[:200]}）"
-    try:
-        return svg.read_text(encoding="utf-8", errors="ignore"), ""
-    except Exception as e:  # noqa: BLE001
-        return None, f"读取 SVG 失败：{e}"
+    # 用隔离临时目录作为 --output，而不是原理图所在目录。
+    # 旧版本曾把「xxx.svg」文件路径直接传给 kicad-cli，KiCad 会把它建成同名目录；
+    # 若仍把原理图目录传给 --output，expected 会命中这个残留目录，读取时报
+    # Permission denied。临时目录还能避免同名 SVG 被覆盖或误读旧文件。
+    with tempfile.TemporaryDirectory(prefix=".kicad_svg_", dir=str(sch_path.parent)) as tmp:
+        out_dir = Path(tmp)
+        res = _run([cli, "sch", "export", "svg", "--no-background-color",
+                    "--output", str(out_dir), str(sch_path)])
+        if not res["ok"]:
+            return None, "kicad-cli 执行失败：" + (res.get("err") or "未知错误")
+        expected = out_dir / (sch_path.stem + ".svg")
+        svg = expected if expected.is_file() else None
+        if svg is None:
+            # 兜底：不同 KiCad 版本可能给导出文件加后缀，按修改时间取最新文件。
+            cands = [p for p in out_dir.rglob("*.svg") if p.is_file()]
+            svg = max(cands, key=lambda p: p.stat().st_mtime, default=None)
+        if svg is None:
+            return None, f"未生成 SVG（输出目录：{out_dir}；kicad 报错：{(res.get('err') or '')[:200]}）"
+        try:
+            return svg.read_text(encoding="utf-8", errors="ignore"), ""
+        except Exception as e:  # noqa: BLE001
+            return None, f"读取 SVG 失败：{e}"
 
 
 # 会话表：session_id -> ctx（保存 Agent 与渲染所需的全部状态），带锁保护。
