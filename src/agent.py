@@ -132,6 +132,11 @@ class Agent:
         """步骤②③④：需求 → BOM → 网表。返回 (bom, netlist, used_llm)。"""
         bom, used = generate_bom(prompt, self.llm, mock=self.mock, symbol_lib=self.symbol_lib)
         netlist, _ = generate_netlist(prompt, bom, self.llm, mock=self.mock, symbol_lib=self.symbol_lib)
+        # 初次设计：修正 ERC 检查不到的功能性拓扑错误（5V 直灌/LED 无限流/
+        # USB 反接/晶振悬空/BOOT0 未拉）。只修检测到的错误，并保留修正说明。
+        from .circuit_fix import fix_topology
+        topology_fixes = fix_topology(bom, netlist, self.symbol_lib)
+        self.state["topology_fixes"] = topology_fixes
         self.state["bom"] = bom
         self.state["netlist"] = netlist
         self.state["prompt"] = prompt
@@ -141,7 +146,8 @@ class Agent:
 
     def _refresh_warnings(self, extra: list[str] | None = None):
         """重算电气安全警告（ERC 不做电气参数检查，这里补一层启发式）。"""
-        w = check_electrical(self.state.get("bom"), self.state.get("netlist"))
+        w = check_electrical(self.state.get("bom"), self.state.get("netlist"),
+                             self.symbol_lib)
         if extra:
             w = extra + w
         self.state["warnings"] = w
