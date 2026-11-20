@@ -65,6 +65,27 @@ def _in_title_block(x: float, y: float, hw: float = 0.0, hh: float = 0.0,
     return (x + hw > tx0 and y + hh > ty0)
 
 
+def _pin_abs(px: float, py: float, ang: float, ix: float, iy: float,
+             mirrored: bool = False):
+    """引脚绝对坐标 + 引出方向。
+
+    库坐标 Y 向上、原理图 Y 向下：正常时 (ix+px, iy-py)。
+    mirrored=True 表示元件左右镜像（KiCad `(mirror y)`，X 取反）：
+    引脚 x 变号，方向角 angle 也左右翻转（0↔180，90/270 不变），
+    这样排针的引脚可以朝向左侧的芯片。
+    返回 (ax, ay, dx, dy)：dx/dy 为「从连接点指向符号体」的单位向量
+    （引出线走反方向）。
+    """
+    if mirrored:
+        ax, ay = ix - px, iy - py
+        a = (180 - int(ang)) % 360
+    else:
+        ax, ay = ix + px, iy - py
+        a = int(ang) % 360
+    dx, dy = _DIRS.get(a, (1, 0))
+    return ax, ay, dx, dy
+
+
 def _u() -> str:
     return str(uuid.uuid4())
 
@@ -349,10 +370,168 @@ def _layout(items, lib, netlist=None, alias=None) -> tuple[dict, str]:
     return positions, "A3"
 
 
-def write_schematic(netlist: dict, bom: dict, output_path, symbols_dir) -> Path:
+def _align_connector_buses(items, lib, netlist, positions, alias, paper):
+    """把「芯片 ↔ 排针」的并行总线摆成镜像对齐的整齐线束。
+
+    典型场景：ATmega 的 D0-D7 连到 8 针排针、A0-A5 连到 6 针排针。
+    默认布局会把排针横放在芯片右侧，引脚引出方向与芯片相同（都朝右），
+    于是十几根线必须绕到排针背后再折回，交叉成团。
+
+    本函数识别这种「排针第 n 脚 ↔ 芯片某脚」一一对应的信号组，把排针
+    左右镜像（引脚改朝左、正对芯片），竖直放到芯片右侧，并让第 n 脚的
+    y 对齐其芯片脚的 y —— 于是每条总线变成一组水平平行线，零交叉。
+
+    仅当排针与芯片之间存在足够多（≥3）的一一对应信号脚时才对齐；
+    且目标位置不得与其它元件/标题栏冲突。任何不确定都保持原布局。
+
+    返回 (新 positions, 需要镜像的位号集合)。
+    """
+    by_ref = {it["ref"]: it for it in items}
+    pins_of = {}
+    for it in items:
+        try:
+            pins_of[it["ref"]] = lib.get_pins(it["symbol"])
+        except Exception:
+            pins_of[it["ref"]] = {}
+
+    # 主芯片：引脚最多的元件（ATmega/STM32 等）
+    anchor = max((r for r in pins_of if pins_of[r]),
+                 key=lambda r: (len(pins_of[r]), r), default=None)
+    if not anchor:
+        return positions, set()
+    ax, ay = positions[anchor]
+
+    def resolve(ref):
+        return alias.get(ref, ref) if alias else ref
+
+    # 收集每个排针到主芯片的一一对应信号脚：{排针脚号: 芯片脚号}
+    nets = netlist.get("nets", [])
+    bus = {}
+    for it in items:
+        ref = it["ref"]
+        lid = it.get("symbol", "")
+        if not re.search(r"Connector:Conn_01x\d+_Pin", lid):
+            continue
+        pairs = {}
+        for net in nets:
+            chip_pins, conn_pins = [], []
+            for pr in net.get("pins", []):
+                r, _, num = pr.partition(":")
+                if not num.isdigit():
+                    continue
+                rr = resolve(r)
+                if rr == anchor:
+                    chip_pins.append(int(num))
+                elif rr == ref:
+                    conn_pins.append(int(num))
+            # 一个排针脚只连一个芯片脚（且网络里没有其它排针脚）才算干净总线
+            if len(conn_pins) == 1 and len(chip_pins) == 1:
+                pairs[conn_pins[0]] = chip_pins[0]
+        if len(pairs) >= 3:
+            bus[ref] = pairs
+
+    if not bus:
+        return positions, set()
+
+    # 芯片右侧边界（引脚最大 x），排针放到其右侧一列。
+    # 需要有足够间距让两侧引出线（各 STUB=7.62）错开：若太近，芯片脚与
+    # 排针脚的引出端点会落到同一栅格列、把相邻的不同网络短接（ERC
+    # multiple_net_names）。实测需 ≥ 芯片引脚右缘 + 25mm。
+    right_edge = ax + max((p[0] for p in pins_of[anchor].values()), default=0)
+    bus_x = _snap(right_edge + 25.4)
+
+    # 每个排针：镜像后引脚相对 y 不变（_pin_abs 镜像只翻 x），
+    # 目标中心 y 取「芯片脚绝对 y - 引脚局部 y」的中位数，使各脚尽量水平对齐。
+    plans = []
+    for ref, pairs in bus.items():
+        cpins = pins_of[ref]
+        targets = []
+        for conn_pin, chip_pin in pairs.items():
+            if conn_pin not in cpins or chip_pin not in pins_of[anchor]:
+                continue
+            py = cpins[conn_pin][1]
+            _, chip_ay, _, _ = _pin_abs(*pins_of[anchor][chip_pin], ax, ay, False)
+            # 镜像只翻 x；排针脚绝对 y = 中心 y - 引脚库 y。
+            # 要让它等于芯片脚 y，则 中心 y = 芯片脚 y + 引脚库 y。
+            targets.append(chip_ay + py)     # 期望的排针中心 y
+        if not targets:
+            continue
+        targets.sort()
+        cy = _snap(targets[len(targets) // 2])
+        ys = [cy - cpins[p][1] for p in pairs if p in cpins]
+        plans.append({"ref": ref, "y": cy, "y0": min(ys), "y1": max(ys),
+                      "pairs": pairs})
+
+    # 按中心 y 排列，若 y 区间重叠则右移一列（避免排针互相压住）
+    plans.sort(key=lambda p: p["y"])
+    occupied = []   # (x0,x1,y0,y1) 已规划的排针占位（含间距）
+    new_pos = dict(positions)
+    mirrored = set()
+    col_x = bus_x
+    def body_half(ref):
+        """元件本体半宽/半高（引脚实际范围 + 小缓冲，不含文字 MARGIN）。"""
+        ps = pins_of[ref].values()
+        return (max((abs(p[0]) for p in ps), default=5) + 2.0,
+                max((abs(p[1]) for p in ps), default=5) + 2.0)
+
+    for plan in plans:
+        ref = plan["ref"]
+        cpins = pins_of[ref]
+        hw, hh = body_half(ref)
+        y0, y1 = plan["y0"] - 2, plan["y1"] + 2
+        placed = False
+        for try_x in (col_x, col_x + 22.86, col_x + 45.72, col_x + 68.58):
+            tx0, tx1 = try_x - hw - 1, try_x + hw + 1
+            # 与其它已摆排针冲突 → 试下一列
+            if any(not (tx1 < o[0] or tx0 > o[1] or y1 < o[2] or y0 > o[3])
+                   for o in occupied):
+                continue
+            # 与未参与总线的元件冲突 → 放弃该排针对齐（保守）
+            clash = False
+            for it in items:
+                r = it["ref"]
+                if r == ref or r in bus:
+                    continue
+                ox, oy = positions[r]
+                ohw, ohh = body_half(r)
+                if not (tx1 < ox - ohw or tx0 > ox + ohw
+                        or y1 < oy - ohh or y0 > oy + ohh):
+                    clash = True
+                    break
+            if clash:
+                continue
+            pw, ph = PAPERS[paper]
+            if try_x + hw > pw - PAGE_MX or _in_title_block(try_x, plan["y"], hw, hh, paper):
+                continue
+            new_pos[ref] = (_snap(try_x), _snap(plan["y"]))
+            mirrored.add(ref)
+            occupied.append((tx0, tx1, y0, y1))
+            placed = True
+            break
+        if placed:
+            col_x = max(col_x, try_x)   # 后续排针优先同列，重叠才右移
+    return new_pos, mirrored
+
+
+def write_schematic(netlist: dict, bom: dict, output_path, symbols_dir,
+                    layout_override: dict | None = None,
+                    mirror_override: set | None = None,
+                    auto_bus: bool = True) -> Path:
+    """生成原理图。
+
+    layout_override / mirror_override 供测试使用；auto_bus 控制是否自动把
+    芯片↔排针的并行总线摆成镜像对齐的整齐线束（默认开启）。
+    """
     lib = SymbolLib(symbols_dir)
     items, alias = _expand_refs(bom["items"])
     positions, paper = _layout(items, lib, netlist, alias)
+    auto_mirror = set()
+    if auto_bus and not layout_override and not mirror_override:
+        positions, auto_mirror = _align_connector_buses(
+            items, lib, netlist, positions, alias, paper)
+    if layout_override:
+        positions.update(layout_override)
+    mirrored = set(auto_mirror) | set(mirror_override or ())
     pin_cache = {}
     etype_cache = {}   # ref -> {引脚号: 电气类型(power_in/power_out/...)}
     for it in items:
@@ -465,21 +644,25 @@ def write_schematic(netlist: dict, bom: dict, output_path, symbols_dir) -> Path:
                 L.append("    " + sdef)
     L.append("  )")
 
-    def _emit_symbol(ref, sym, x, y, pins, value, in_bom="yes", hide_text=False):
+    def _emit_symbol(ref, sym, x, y, pins, value, in_bom="yes", hide_text=False,
+                     mirror_y=False):
         """输出一个符号实例（带库前缀 lib_id，内嵌定义同名）。
 
         hide_text=True 时隐藏 Reference/Value 文字（用于 PWR_FLAG 这类
         内部标记——KiCad 规范里它们本就不显示，否则 "PWR_FLAG" 长文字
         会压住旁边元件的网络标签与 Reference/Value）。
+        mirror_y=True 输出 `(mirror y)`，让元件左右翻转、引脚朝向相反侧，
+        用于把排针的引脚转向芯片以形成整齐的平行总线。
         """
         hw = hh = MARGIN
         if pins:
             hw = max(abs(p[0]) for p in pins.values()) + MARGIN
             hh = max(abs(p[1]) for p in pins.values()) + MARGIN
         hide = " (hide yes)" if hide_text else ""
+        mirror = "\n    (mirror y)" if mirror_y else ""
         L.append("  (symbol")
         L.append(f'    (lib_id "{sym}")')
-        L.append(f"    (at {_fmt(x)} {_fmt(y)} 0)")
+        L.append(f"    (at {_fmt(x)} {_fmt(y)} 0){mirror}")
         L.append("    (unit 1)")
         L.append("    (exclude_from_sim no)")
         L.append(f"    (in_bom {in_bom})")
@@ -515,7 +698,8 @@ def write_schematic(netlist: dict, bom: dict, output_path, symbols_dir) -> Path:
         ref, sym = it["ref"], it["symbol"]
         x, y = positions[ref]
         _, pins = pin_cache[ref]
-        _emit_symbol(ref, sym, x, y, pins, it.get("value", ""))
+        _emit_symbol(ref, sym, x, y, pins, it.get("value", ""),
+                     mirror_y=(ref in mirrored))
 
     def _wire(x1, y1, x2, y2):
         L.append("  (wire")
@@ -546,8 +730,7 @@ def write_schematic(netlist: dict, bom: dict, output_path, symbols_dir) -> Path:
             sym, pins = pin_cache[r]
             px, py, ang = pins[key]
             ix, iy = positions[r]
-            ax, ay = ix + px, iy - py             # Y 取反（库 Y 向上 → 原理图 Y 向下）
-            dx, dy = _DIRS.get(int(ang) % 360, (1, 0))
+            ax, ay, dx, dy = _pin_abs(px, py, ang, ix, iy, r in mirrored)
             ex, ey = ax - dx * STUB, ay + dy * STUB
             k = (round(ax, 3), round(ay, 3), name)
             if k in emitted:
@@ -587,11 +770,13 @@ def write_schematic(netlist: dict, bom: dict, output_path, symbols_dir) -> Path:
         for gj in range(max(0, tgj0), ny):
             blocked.add((gi, gj))
     for it in items:
-        _, pins = pin_cache[it["ref"]]
+        ref = it["ref"]
+        _, pins = pin_cache[ref]
         if not pins:
             continue
-        ix, iy = positions[it["ref"]]
-        xs = [p[0] for p in pins.values()]
+        ix, iy = positions[ref]
+        mir = ref in mirrored
+        xs = [(-p[0] if mir else p[0]) for p in pins.values()]
         ys = [p[1] for p in pins.values()]
         pad = 2.54
         x0, x1 = ix + min(xs) - pad, ix + max(xs) + pad
@@ -674,20 +859,21 @@ def write_schematic(netlist: dict, bom: dict, output_path, symbols_dir) -> Path:
         ref = it["ref"]
         _, pins = pin_cache[ref]
         ix, iy = positions[ref]
-        for n, (px, py, _a) in pins.items():
+        for n, (px, py, a) in pins.items():
             if (ref, n) in connected:
-                connected_xy.add((round(ix + px, 3), round(iy - py, 3)))
+                ax, ay, _dx, _dy = _pin_abs(px, py, a, ix, iy, ref in mirrored)
+                connected_xy.add((round(ax, 3), round(ay, 3)))
     nc_xy = set()
     for it in items:
         ref = it["ref"]
         _, pins = pin_cache[ref]
         ix, iy = positions[ref]
-        for n, (px, py, _a) in pins.items():
+        for n, (px, py, a) in pins.items():
             if (ref, n) in connected:
                 continue
             if etype_cache.get(ref, {}).get(n) == "no_connect":   # 坑①
                 continue
-            ax, ay = ix + px, iy - py
+            ax, ay, _dx, _dy = _pin_abs(px, py, a, ix, iy, ref in mirrored)
             key = (round(ax, 3), round(ay, 3))
             if key in connected_xy or key in nc_xy:              # 坑②
                 continue
