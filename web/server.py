@@ -210,6 +210,19 @@ def _render_and_package(ctx: dict, autofix: bool, max_fix: int = 2) -> dict:
 def run_design(prompt: str, mock: bool, autofix: bool, max_fix: int = 2) -> dict:
     cfg = None if mock else load_config()
     cli = _kicad_cli(cfg)
+    # 非离线模式：先确认 LLM 真的可用。否则 Agent 会把初始化异常静默吞掉、
+    # 令 llm=None，最终被误报成「离线模式且未匹配到内置板卡」，误导用户。
+    if not mock:
+        key = (cfg.get("llm") or {}).get("api_key")
+        if not key:
+            raise RuntimeError(
+                "未检测到 LLM 密钥。请在 config/config.toml 的 [llm].api_key 填入密钥，"
+                "或勾选「离线模式」用内置示例生成。")
+        try:
+            from src.llm_client import LLMClient
+            LLMClient(cfg)               # 仅校验可初始化（依赖/密钥是否就绪）
+        except Exception as e:
+            raise RuntimeError(f"LLM 初始化失败：{e}。请修复环境或勾选「离线模式」。") from e
     agent = Agent(cfg=cfg, mock=mock)
     bom, netlist, used = agent.design(prompt)
 
