@@ -816,6 +816,26 @@ def write_schematic(netlist: dict, bom: dict, output_path, symbols_dir,
             for gj in range(max(0, j0), min(ny, j1 + 1)):
                 blocked.add((gi, gj))
 
+    # PWR_FLAG 的菱形本体画在引脚点上方约 2 格（库轮廓 (0,0)→(0,2.54)），
+    # 但引脚点才是电气端点。若只保护引脚点，其它网络的走线会从菱形符号底下
+    # 穿过，视觉上像「叠线」（电气并未相连）。把菱形占据的上方格也列为障碍，
+    # 让走线绕开；但排除所有真实端点格（端点必须可达）。
+    endpoint_cells = set()
+    for _job in net_jobs:
+        for _e in _job["ends"]:
+            endpoint_cells.add(_to_grid(_e[0], _e[1]))
+            endpoint_cells.add(_to_grid(_e[2], _e[3]))
+        if _job["flag"]:
+            endpoint_cells.add(_to_grid(_job["flag"][0], _job["flag"][1]))
+    for _job in net_jobs:
+        if not _job["flag"]:
+            continue
+        _gi, _gj = _to_grid(_job["flag"][0], _job["flag"][1])
+        for _dj in (1, 2):
+            _c = (_gi, _gj - _dj)
+            if _c not in endpoint_cells:
+                blocked.add(_c)
+
     # ④ 预先登记各网络的引出线与端点。
     #    关键：引脚引出线（stub）整段都要登记！过去只登记端点 (ex,ey)，
     #    导致其它网络的走线可以横穿某引脚的整段 stub——这正是截图里芯片脚
