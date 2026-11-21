@@ -886,10 +886,12 @@ def write_schematic(netlist: dict, bom: dict, output_path, symbols_dir,
 
     # ⑥ 输出引出线、标签和 PWR_FLAG。
     # 已用导线连通的网络只挂一个标签；未接通的端点保留标签兜底。
+    junc_pts = set()   # 引脚电气连接点：加实心圆点，明确「线接在这里」
     for job in net_jobs:
         name = job["name"]
         for ax, ay, ex, ey, odx, ody in job["ends"]:
             _wire(ax, ay, ex, ey)
+            junc_pts.add((round(ax, 3), round(ay, 3)))
         touched = sorted(job["touched"])
         primary = touched[0] if touched else 0
         for i, (ax, ay, ex, ey, odx, ody) in enumerate(job["ends"]):
@@ -906,6 +908,17 @@ def write_schematic(netlist: dict, bom: dict, output_path, symbols_dir,
             _emit_symbol(fref, "power:PWR_FLAG", fx, fy,
                          {1: (0.0, 0.0, 90.0)}, "PWR_FLAG", in_bom="no",
                          hide_text=True)
+
+    # 引脚电气连接点画实心圆点（junction）：纯视觉标记，让「导线确实接到了
+    # 针脚」一眼可见，消除 stub 末端那种「悬空线头」的观感。不改电气连接，
+    # ERC 不检查 junction 是否必要，因此不会影响违规数。多脚同坐标会去重。
+    for jx, jy in sorted(junc_pts):
+        L.append("  (junction")
+        L.append(f"    (at {_fmt(jx)} {_fmt(jy)})")
+        L.append("    (diameter 0)")
+        L.append('    (color 0 0 0 0)')
+        L.append(f'    (uuid "{_u()}")')
+        L.append("  )")
 
     # 未接入任何网络的引脚打 no_connect（KiCad 规范的「故意悬空」标记）。
     # 两个必须避开的坑（ESP32 这类多 GND 脚芯片上踩过）：
