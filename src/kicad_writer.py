@@ -127,6 +127,19 @@ def _from_grid(i: int, j: int) -> tuple[float, float]:
     return i * GRID, j * GRID
 
 
+def _text_cells(cell: tuple[int, int], text: str, angle: int = 0) -> set:
+    """文字在 1.27mm 栅格上的近似占位（用于通用文字避让，不改电气）。
+
+    SVG 实证 KiCad 8 的 label 恒为 text-anchor=middle：0/180 都是横排
+    （仅小箭头朝向不同），90/270 才是竖排。旧版按「180 向右、0 向左」
+    预留避让区，与真实文字错位半个词宽，是标签互压/被穿的根源。
+    """
+    gi, gj = cell
+    half = max(1, len(str(text))) // 2
+    if angle in (90, 270):
+        return {(gi, gj + k) for k in range(-half, half + 1)}
+    return {(gi + k, gj) for k in range(-half, half + 1)}
+
 def _mst_edges(points: list[tuple[int, int]]) -> list[tuple[int, int]]:
     """按曼哈顿距离给端点集合生成最小生成树边（Prim）。"""
     n = len(points)
@@ -153,22 +166,35 @@ def _mst_edges(points: list[tuple[int, int]]) -> list[tuple[int, int]]:
 # 穿越一条「别人已占的走线」的代价。设为软惩罚而非硬禁止：硬禁止会
 # 把密集区域彻底封死，导致大量网络走不通、退化成断线+标签（实测标签
 # 24→38）。软惩罚让路由器「能绕则绕、绕不开才穿」，兼顾少交叉与连通。
-CROSS_COST = 40
+# 40 会让 VCC 之类网络为了绕开 PWR_FLAG 引线走出很大的 U 形（如 LM1117
+# 里 VCC 绕到 x=25.4 再折回）；降到 25 后走线走直线、交叉仍为 0，且
+# Arduino 大板的走线/标签/交叉统计完全不变（实测）。
+CROSS_COST = 25
 
 
-def _route_path(start, goal, blocked, soft, hard, key, nx, ny, end_cells=()):
+def _edge_key(a, b):
+    """无向栅格边的稳定标识（用于阻止异网复用同一段导线）。"""
+    return tuple(sorted((a, b)))
+
+
+def _route_path(start, goal, blocked, soft, hard, key, nx, ny, end_cells=(),
+                edges=None, vertices=None):
     """在栅格上找一条「少拐弯、少穿越」的正交路径。
 
     Dijkstra 代价 = 步长 + 转向惩罚 + 穿越其它网络既有走线的软惩罚。
-    两类障碍：
-      • 符号本体 (blocked) 与「别人的端点」(hard) 是硬障碍——绝对不可穿。
-        端点若被穿越，两条不同网络的线会在同一点相连，触发 ERC
-        multiple_net_names（踩过：ICSP_MISO/SCK 被竖线同时穿过）。
+    三类硬障碍：
+      • 符号本体 (blocked)；
+      • 别人的电气端点/stub (hard)；
+      • 别人的**已画导线边** (edges) 和**拐点/端点** (vertices)。
+        前两类防止穿引脚，后两类防止两条异网导线复用同一段或在同一点
+        收口——KiCad 会把它们当成同一条线，触发 multiple_net_names。
       • 别人的走线中段 (soft) 只是「贵」不是「禁」——能绕则绕、绕不开
         才穿（十字交叉在 KiCad 里不相连），兼顾少交叉与连通。
-    soft/hard: {栅格点: {网络 key}}；end_cells 为本网端点，穿越不罚。
-    返回栅格节点列表（含起终点），失败返回 None。
+    soft/hard/vertices: {栅格点: {网络 key}}；edges: {无向边: {网络 key}}。
+    end_cells 为本网端点，穿越不罚。返回栅格节点列表或 None。
     """
+    edges = edges or {}
+    vertices = vertices or {}
     if start == goal:
         return [start]
 
@@ -212,6 +238,15 @@ def _route_path(start, goal, blocked, soft, hard, key, nx, ny, end_cells=()):
             hard_users = hard.get(nxt)
             if hard_users and key not in hard_users:     # 别人的端点硬障碍
                 continue
+            # 异网不能复用同一条边，也不能在对方拐点/端点落脚：
+            # 过去 _wire 去重把异网同段静默丢掉，造成一条网络被另一条
+            # 网络「搭桥」，是 multiple_net_names 的隐藏根因。
+            edge_users = edges.get(_edge_key((x, y), nxt))
+            if edge_users and key not in edge_users:
+                continue
+            vertex_users = vertices.get(nxt)
+            if vertex_users and key not in vertex_users:
+                continue
             nstate = (nxt[0], nxt[1], nd)
             ncost = cost + 1 + (0 if direction in (-1, nd) else 4) \
                     + cross_penalty(nxt)
@@ -222,14 +257,17 @@ def _route_path(start, goal, blocked, soft, hard, key, nx, ny, end_cells=()):
     return None
 
 
-def _shorten_path(path, blocked, soft, hard, key):
+def _shorten_path(path, blocked, soft, hard, key, edges=None, vertices=None):
     """在仍可通行的前提下合并绕路产生的多余拐角，减少线段数。
 
     与 _route_path 一致：别的网络的走线是软障碍——短缩时不主动穿过它们
-    （避免引入新交叉），但符号本体仍是硬障碍。
+    （避免引入新交叉），但符号本体仍是硬障碍。edges/vertices 进一步
+    阻止异网复用同一段或同一拐点。
     """
     if len(path) <= 2:
         return path
+    edges = edges or {}
+    vertices = vertices or {}
 
     def clear(a, b):
         if a[0] == b[0]:
@@ -240,6 +278,10 @@ def _shorten_path(path, blocked, soft, hard, key):
             cells = [(i, a[1]) for i in range(lo, hi + 1)]
         else:
             return False
+        for u, v in zip(cells, cells[1:]):
+            edge_users = edges.get(_edge_key(u, v))
+            if edge_users and key not in edge_users:
+                return False
         for c in cells:
             if c in (a, b):
                 continue
@@ -247,6 +289,9 @@ def _shorten_path(path, blocked, soft, hard, key):
                 return False
             hard_users = hard.get(c)
             if hard_users and key not in hard_users:   # 别人的端点不可穿
+                return False
+            vertex_users = vertices.get(c)
+            if vertex_users and key not in vertex_users:
                 return False
             users = soft.get(c)
             if users and users != {key}:          # 别人的线：短缩不越过
@@ -263,6 +308,91 @@ def _shorten_path(path, blocked, soft, hard, key):
                 break
         out.append(path[best])
         i = best
+    return _straighten_steps(out, blocked, soft, hard, key, edges, vertices)
+
+
+def _straighten_steps(path, blocked, soft, hard, key, edges=None, vertices=None):
+    """消除「一格回折台阶」：路径末段 A→B→C→D 中，若把中间的下探/
+    上探折回改走直角能少一个拐点、且新段通道干净，就重写成 A→A'→D。
+
+    典型场景：走到引脚 stub 末端时先下探一格再左折回来，视觉上像一个小
+    台阶（如 LM1117 里 C3 下脚 GND 线）。_shorten_path 只能合并共线段，
+    无法重建这种 L 形，这里补一步。只处理 4 点的回折，且要求新路径的
+    两段都是正交、通道 clear，避免引入新交叉或穿过别的网络。
+    """
+    if len(path) < 4:
+        return path
+    edges = edges or {}
+    vertices = vertices or {}
+
+    def clear2(a, b):
+        if a[0] == b[0]:
+            lo, hi = sorted((a[1], b[1]))
+            cells = [(a[0], j) for j in range(lo, hi + 1)]
+        elif a[1] == b[1]:
+            lo, hi = sorted((a[0], b[0]))
+            cells = [(i, a[1]) for i in range(lo, hi + 1)]
+        else:
+            return False
+        for u, v in zip(cells, cells[1:]):
+            edge_users = edges.get(_edge_key(u, v))
+            if edge_users and key not in edge_users:
+                return False
+        for c in cells:
+            if c in (a, b):
+                continue
+            if c in blocked:
+                return False
+            hu = hard.get(c)
+            if hu and key not in hu:
+                return False
+            vu = vertices.get(c)
+            if vu and key not in vu:
+                return False
+            u = soft.get(c)
+            if u and u != {key}:
+                return False
+        return True
+
+    def bends(p):
+        n = 0
+        for i in range(1, len(p) - 1):
+            a, b, c = p[i - 1], p[i], p[i + 1]
+            if (a[0] == b[0]) != (b[0] == c[0]):
+                n += 1
+        return n
+
+    out = list(path)
+    # 反复扫描，直到没有可消除的台阶
+    for _ in range(len(out)):
+        changed = False
+        for i in range(len(out) - 3):
+            a, b, c, d = out[i], out[i + 1], out[i + 2], out[i + 3]
+            # 只处理 AB⊥BC 且 BC⊥CD（两次直角，形成台阶/Z 形）
+            ab_v = a[0] == b[0]
+            bc_v = b[0] == c[0]
+            cd_v = c[0] == d[0]
+            if not (ab_v != bc_v and bc_v != cd_v):
+                continue
+            # 候选：把 b,c 换成一个角点 e，使 a→e→d 为正交两段
+            for e in ((d[0], a[1]), (a[0], d[1])):
+                if e == a or e == d or e == b or e == c:
+                    continue
+                if not (clear2(a, e) and clear2(e, d)):
+                    continue
+                cand = out[:i] + [a, e, d] + out[i + 4:]
+                # 必须减少拐点数，或拐点相等但线段更短
+                old_len = (abs(a[0]-b[0])+abs(a[1]-b[1]) + abs(b[0]-c[0])+abs(b[1]-c[1])
+                           + abs(c[0]-d[0])+abs(c[1]-d[1]))
+                new_len = abs(a[0]-e[0])+abs(a[1]-e[1]) + abs(e[0]-d[0])+abs(e[1]-d[1])
+                if bends(cand) < bends(out) or (bends(cand) == bends(out) and new_len < old_len):
+                    out = cand
+                    changed = True
+                    break
+            if changed:
+                break
+        if not changed:
+            break
     return out
 
 
@@ -371,19 +501,26 @@ def _layout(items, lib, netlist=None, alias=None) -> tuple[dict, str]:
                     candidates.append((cost(cx, cy), cx, cy))
 
             if not candidates:
-                # 兜底：粗网格扫描第一个不重叠的位置
-                step = GRID * 4
-                cx0 = _snap(PAGE_MX + hw)
-                cy0 = _snap(PAGE_MY + hh)
-                for cy in range(int(cy0), int(ph - PAGE_MY - hh) + 1, int(step)):
-                    for cx in range(int(cx0), int(pw - PAGE_MX - hw) + 1, int(step)):
+                # 兜底：粗网格扫描所有不重叠位置，按 cost 取最靠近亲密邻居的一处。
+                # 旧实现取「页顶第一个空格」，会把被挤到兜底的元件（如新增晶振 Y1）
+                # 丢到页面顶部 (y≈31)，离它的网络标签/配对芯片很远，造成断线和线头。
+                # 改为全网格评估、按加权距离选最优，让兜底元件仍贴近相关网络。
+                # 必须按**栅格索引**扫描：旧写法 `range(int(坐标), ..., int(2.54))`
+                # 实际是以 2 毫米为步长，会把兜底元件放到 117/151 这类
+                # 非 1.27 栅格坐标，符号引脚随之离网，ERC 报 endpoint_off_grid /
+                # wire_dangling。用 _to_grid→_from_grid 保证兜底位置也严格落网。
+                i0, j0 = _to_grid(PAGE_MX + hw, PAGE_MY + hh)
+                i1, j1 = _to_grid(pw - PAGE_MX - hw, ph - PAGE_MY - hh)
+                fallback = []
+                for j in range(j0, j1 + 1, 2):
+                    _gx, cy = _from_grid(0, j)
+                    for i in range(i0, i1 + 1, 2):
+                        cx, _gy = _from_grid(i, 0)
                         if _in_title_block(cx, cy, hw, hh, paper, whole_row=True):
                             continue
                         if not overlap(cx, cy):
-                            candidates.append((cost(cx, cy), cx, cy))
-                            break
-                    if candidates:
-                        break
+                            fallback.append((cost(cx, cy), cx, cy))
+                candidates.extend(fallback)
             if not candidates:
                 placed_ok = False
                 break
@@ -582,6 +719,72 @@ def write_schematic(netlist: dict, bom: dict, output_path, symbols_dir,
         hh = max((abs(p[1]) for p in pins.values()), default=5.0) + MARGIN
         boxes.append((x, y, hw, hh))
 
+    # 元件 Reference/Value 文字的位置。过去各元件独立按自身 hh 推离中心，
+    # 两个元件竖排靠近时，上元件的 Value 与下元件的 Reference 会落进同一空隙
+    # 贴成一团（实测 R1.Value y=135.19 与 SW2.Reference y=136.59 仅差 1.4mm）。
+    # 这里先按原始期望位置收集，再对「同列」文字做纵向避让，统一供占位与输出
+    # 使用——生成器与 visual_check 用同一套 MIN_TEXT_PITCH，避免自检漏判。
+    prop_y = {}          # (ref, kind) -> 避让后的绝对 y
+    prop_texts = []      # {ref, kind, x, y, cy, text}
+    for it in items:
+        ref = it["ref"]
+        x, y = positions[ref]
+        _, pins = pin_cache[ref]
+        hh = max((abs(p[1]) for p in pins.values()), default=5.0) + MARGIN
+        for kind, text, ty in (("Reference", ref, y - hh - 2.54),
+                               ("Value", it.get("value", ""), y + hh + 2.54)):
+            if str(text).strip():
+                prop_texts.append({"ref": ref, "kind": kind, "x": x,
+                                   "y": ty, "cy": y, "text": str(text)})
+
+    # 按「横向 bbox 是否相交」分组（并查集），而非只看完全相同的 x 网格。
+    # 原因：宽 Value（如 "LM317"、"LM1117T-5.0"）半宽可达 3~7mm，会横向跨列
+    # 压到相邻元件的 Reference/Value 上；仅按同列避让会漏掉这种跨列互压
+    # （visual_check 用 bbox 判重叠，因此自检仍报错）。凡横向区间相交的文字
+    # 并入同组，组内从下往上做「夹紧 + 拉开」：
+    #   1) 任何文字不得越过标题栏上沿或页面下边距；
+    #   2) 相邻两行间距 >= MIN_PROP_PITCH（2.5 格，> 自检的 2.54 报警线）。
+    # 横向不相交的文字即使纵向接近也不会视觉冲突，无需约束。
+    MIN_PROP_PITCH = 3.175
+    CHAR_W = 1.27                           # 与 visual_check.text_bbox 一致
+    pw, ph = PAPERS[paper]
+    y_floor = PAGE_MY + 2.0                 # 上边界
+    y_ceil = ph - TITLE_H - 2.0             # 标题栏上沿（留 2mm 缓冲）
+    nprop = len(prop_texts)
+    for p in prop_texts:
+        p["hw"] = max(1, len(p["text"])) * CHAR_W / 2
+    parent = list(range(nprop))
+
+    def _find(a):
+        while parent[a] != a:
+            parent[a] = parent[parent[a]]
+            a = parent[a]
+        return a
+
+    for i in range(nprop):
+        for j in range(i + 1, nprop):
+            if abs(prop_texts[i]["x"] - prop_texts[j]["x"]) < \
+                    prop_texts[i]["hw"] + prop_texts[j]["hw"]:
+                ri, rj = _find(i), _find(j)
+                if ri != rj:
+                    parent[rj] = ri
+    cols = {}
+    for i, p in enumerate(prop_texts):
+        cols.setdefault(_find(i), []).append(p)
+    for col in cols.values():
+        col.sort(key=lambda p: p["y"])
+        for i in range(len(col) - 1, -1, -1):
+            col[i]["y"] = min(col[i]["y"], y_ceil)
+            if i < len(col) - 1:
+                col[i]["y"] = min(col[i]["y"],
+                                  col[i + 1]["y"] - MIN_PROP_PITCH)
+            col[i]["y"] = max(col[i]["y"], y_floor)
+
+    property_cells = set()
+    for p in prop_texts:
+        prop_y[(p["ref"], p["kind"])] = p["y"]
+        property_cells.update(_text_cells(_to_grid(p["x"], p["y"]), p["text"]))
+
     def _hits_symbol(fx: float, fy: float) -> bool:
         """电源旗标放置点是否压到任何符号包围盒（留 2mm 缓冲）。"""
         return any(abs(fx - bx) < bw + 2 and abs(fy - by) < bh + 2
@@ -673,7 +876,8 @@ def write_schematic(netlist: dict, bom: dict, output_path, symbols_dir,
     L.append("  )")
 
     def _emit_symbol(ref, sym, x, y, pins, value, in_bom="yes", hide_text=False,
-                     mirror_y=False):
+                     mirror_y=False, text_y=None):
+        """text_y: (Reference_y, Value_y) 避让后的绝对坐标（None 则按 hh 推算）。"""
         """输出一个符号实例（带库前缀 lib_id，内嵌定义同名）。
 
         hide_text=True 时隐藏 Reference/Value 文字（用于 PWR_FLAG 这类
@@ -688,6 +892,8 @@ def write_schematic(netlist: dict, bom: dict, output_path, symbols_dir,
             hh = max(abs(p[1]) for p in pins.values()) + MARGIN
         hide = " (hide yes)" if hide_text else ""
         mirror = "\n    (mirror y)" if mirror_y else ""
+        if text_y is None:
+            text_y = (y - hh - 2.54, y + hh + 2.54)
         L.append("  (symbol")
         L.append(f'    (lib_id "{sym}")')
         L.append(f"    (at {_fmt(x)} {_fmt(y)} 0){mirror}")
@@ -698,11 +904,11 @@ def write_schematic(netlist: dict, bom: dict, output_path, symbols_dir,
         L.append("    (dnp no)")
         L.append(f'    (uuid "{_u()}")')
         L.append(f'    (property "Reference" "{ref}"')
-        L.append(f"      (at {_fmt(x)} {_fmt(y - hh - 2.54)} 0)")
+        L.append(f"      (at {_fmt(x)} {_fmt(text_y[0])} 0)")
         L.append(f'      (effects (font (size 1.27 1.27)){hide})')
         L.append("    )")
         L.append(f'    (property "Value" "{value}"')
-        L.append(f"      (at {_fmt(x)} {_fmt(y + hh + 2.54)} 0)")
+        L.append(f"      (at {_fmt(x)} {_fmt(text_y[1])} 0)")
         L.append(f'      (effects (font (size 1.27 1.27)){hide})')
         L.append("    )")
         for prop in ("Footprint", "Datasheet", "Description"):
@@ -727,16 +933,24 @@ def write_schematic(netlist: dict, bom: dict, output_path, symbols_dir,
         x, y = positions[ref]
         _, pins = pin_cache[ref]
         _emit_symbol(ref, sym, x, y, pins, it.get("value", ""),
-                     mirror_y=(ref in mirrored))
+                     mirror_y=(ref in mirrored),
+                     text_y=(prop_y.get((ref, "Reference"), y - 20),
+                             prop_y.get((ref, "Value"), y + 20)))
 
-    def _wire(x1, y1, x2, y2):
-        L.append("  (wire")
-        L.append("    (pts")
-        L.append(f"      (xy {_fmt(x1)} {_fmt(y1)}) (xy {_fmt(x2)} {_fmt(y2)})")
-        L.append("    )")
-        L.append('    (stroke (width 0) (type solid))')
-        L.append(f'    (uuid "{_u()}")')
-        L.append("  )")
+    wire_segments = []   # (x1, y1, x2, y2, net_key)，用于通用 T 型接点检测
+    wire_buffer = []     # 先缓冲，最后统一裁掉悬空短线头再输出
+    wire_seen = set()    # 去重：收口路径与引出线可能画出同一段（正反均算重复）
+
+    def _wire(x1, y1, x2, y2, key=None):
+        a, b = (round(x1, 3), round(y1, 3)), (round(x2, 3), round(y2, 3))
+        # key 必须参与去重：过去异网同段会被静默丢掉，造成一条网络的线
+        # 被另一条网络「搭桥」，是 multiple_net_names 的隐藏根因。
+        uniq = (tuple(sorted((a, b))), key)
+        if uniq in wire_seen:
+            return
+        wire_seen.add(uniq)
+        wire_buffer.append((x1, y1, x2, y2, key))
+        wire_segments.append((x1, y1, x2, y2, key))
 
     # 引脚引出线 + 网络标签 + 同网导线互连 + PWR_FLAG + 未连引脚 no_connect。
     # 方向要点：pin 的 angle 指向符号体，引出线走外侧（反向）；Y 轴要翻转。
@@ -745,7 +959,6 @@ def write_schematic(netlist: dict, bom: dict, output_path, symbols_dir,
     pw, ph = PAPERS[paper]
     emitted = set()
     net_jobs = []
-    flag_no = 0
     for net in netlist["nets"]:
         ok = _net_valid_pins(net)
         if len(ok) < 2:                           # 单引脚网络 → 引脚打 no_connect
@@ -768,36 +981,81 @@ def write_schematic(netlist: dict, bom: dict, output_path, symbols_dir,
         if len(ends) < 2:
             continue
 
-        # ② PWR_FLAG 位置（仍按电气类型判定，带符号避让）
-        flag = None
-        if _net_needs_flag(net):
-            ax, ay, ex, ey, odx, ody = ends[0]
-            cands = [(0.0, -12.7), (0.0, 12.7),
-                     (odx * 12.7, ody * 12.7), (-odx * 12.7, -ody * 12.7)]
-            fx = fy = None
-            for ox, oy in cands:
-                tx, ty = _snap(ex + ox), _snap(ey + oy)
-                if not _hits_symbol(tx, ty) and not _in_title_block(tx, ty, 3, 3, paper):
-                    fx, fy = tx, ty
-                    break
-            if fx is None:
-                fx, fy = _snap(ex + odx * 12.7), _snap(ey + ody * 12.7)
-            flag_no += 1
-            flag = (fx, fy, f"#FLG{flag_no:02d}")
-
-        net_jobs.append({"name": name, "ends": ends, "flag": flag,
+        net_jobs.append({"key": len(net_jobs), "name": name, "ends": ends,
+                         "flag": None, "needs_flag": _net_needs_flag(net),
                          "touched": set(),
                          "refs": {r for r, _k in ok}})
 
+    # ② PWR_FLAG 位置：所有网络的引出线都收集完后统一排布。
+    #    过去逐网放置时，VCC/GND 从相邻排针引出，两个旗标会被放到同一 x
+    #    坐标、只隔 1 格（2.54mm），菱形尖角叠在一起。这里统一检查已放旗标
+    #    和全部引脚引出线，给每个旗标留出独立空间。
+    stub_cells = set()
+    for _job in net_jobs:
+        for _e in _job["ends"]:
+            _a, _b = _to_grid(_e[0], _e[1]), _to_grid(_e[2], _e[3])
+            if _a[0] == _b[0]:
+                _step = 1 if _b[1] >= _a[1] else -1
+                _cells = [(_a[0], _j) for _j in range(_a[1], _b[1] + _step, _step)]
+            else:
+                _step = 1 if _b[0] >= _a[0] else -1
+                _cells = [(_i, _a[1]) for _i in range(_a[0], _b[0] + _step, _step)]
+            stub_cells.update(_cells)
+
+    flag_no = 0
+    placed_flags = []   # 已放旗标的栅格端点 (gi, gj)
+    for job in net_jobs:
+        if not job["needs_flag"]:
+            continue
+        cands = []
+        for ax, ay, ex, ey, odx, ody in job["ends"]:
+            # 先试就近 1 格距离，再逐步外扩；每个引脚都试，避免相邻网络的
+            # 旗标只能挤在同一个引出点附近。
+            for dist in (12.7, 25.4, 38.1):
+                for ox, oy in ((0.0, -dist), (0.0, dist),
+                               (odx * dist, ody * dist),
+                               (-odx * dist, -ody * dist),
+                               (dist, 0.0), (-dist, 0.0)):
+                    cands.append((ex + ox, ey + oy))
+        fx = fy = None
+        for tx, ty in cands:
+            gi, gj = _to_grid(tx, ty)
+            tx, ty = _from_grid(gi, gj)
+            if not (3 <= gi <= int((pw - 3) / GRID)
+                    and 3 <= gj <= int((ph - 3) / GRID)):
+                continue
+            # 菱形本体在引脚点上方约 2 格，连同引脚点一起做避让。
+            body = [(gi, gj), (gi, gj - 1), (gi, gj - 2)]
+            if any(c in stub_cells for c in body):
+                continue
+            if any(_hits_symbol(bx, by)
+                   or _in_title_block(bx, by, 3, 3, paper)
+                   for bx, by in (_from_grid(*c) for c in body)):
+                continue
+            # 与已有旗标至少留 1 格空隙：本体区间 [gj-2, gj] 各外扩 1 格。
+            if any(abs(gi - pgi) <= 2
+                   and not (gj + 1 < pgj - 3 or gj - 3 > pgj + 1)
+                   for pgi, pgj in placed_flags):
+                continue
+            fx, fy = tx, ty
+            placed_flags.append((gi, gj))
+            break
+        if fx is None:
+            # 极端拥挤时的兜底：至少保证电气上能放下旗标（ERC 优先于观感）。
+            ax, ay, ex, ey, odx, ody = job["ends"][0]
+            fx, fy = _snap(ex + odx * 12.7), _snap(ey + ody * 12.7)
+            placed_flags.append(_to_grid(fx, fy))
+        flag_no += 1
+        job["flag"] = (fx, fy, f"#FLG{flag_no:02d}")
+
     # ④ 障碍物：元件符号本体（引脚包围盒 + 2.54mm，比布局占位盒小，
-    #    保证引出线端点仍在障碍外）。
+    #    保证引出线端点仍在障碍外）+ 标题栏 + PWR_FLAG 菱形本体。
+    #    这些是**通用**规则，对任意板卡都生效，不是针对某一张图的补丁。
     nx, ny = int(pw / GRID) + 1, int(ph / GRID) + 1
-    blocked = set()
-    # 标题栏禁区列为障碍：任何网络的走线都不得穿进右下角标题栏。
     tgi0, tgj0 = _to_grid(pw - TITLE_W, ph - TITLE_H)
-    for gi in range(max(0, tgi0), nx):
-        for gj in range(max(0, tgj0), ny):
-            blocked.add((gi, gj))
+    blocked = {(gi, gj)
+               for gi in range(max(0, tgi0), nx)
+               for gj in range(max(0, tgj0), ny)}
     for it in items:
         ref = it["ref"]
         _, pins = pin_cache[ref]
@@ -807,6 +1065,13 @@ def write_schematic(netlist: dict, bom: dict, output_path, symbols_dir,
         mir = ref in mirrored
         xs = [(-p[0] if mir else p[0]) for p in pins.values()]
         ys = [p[1] for p in pins.values()]
+        # 通用：符号本体以局部原点 (0,0) 为中心，引脚线从本体伸向电气点。
+        # 过去只用电气点算障碍盒，单侧引脚元件（排针/连接器，如 J1 5V 排针
+        # 电气点局部 x=5.08、本体在 x=0~1.27）会漏掉本体那段，导致异网走线
+        # 贴着本体右缘（引脚红线区）穿过，视觉上像交叉。把局部原点 0 纳入
+        # 范围即可覆盖本体，对所有板卡统一生效。
+        xs = xs + [0.0]
+        ys = ys + [0.0]
         pad = 2.54
         x0, x1 = ix + min(xs) - pad, ix + max(xs) + pad
         y0, y1 = iy - max(ys) - pad, iy - min(ys) + pad
@@ -816,10 +1081,6 @@ def write_schematic(netlist: dict, bom: dict, output_path, symbols_dir,
             for gj in range(max(0, j0), min(ny, j1 + 1)):
                 blocked.add((gi, gj))
 
-    # PWR_FLAG 的菱形本体画在引脚点上方约 2 格（库轮廓 (0,0)→(0,2.54)），
-    # 但引脚点才是电气端点。若只保护引脚点，其它网络的走线会从菱形符号底下
-    # 穿过，视觉上像「叠线」（电气并未相连）。把菱形占据的上方格也列为障碍，
-    # 让走线绕开；但排除所有真实端点格（端点必须可达）。
     endpoint_cells = set()
     for _job in net_jobs:
         for _e in _job["ends"]:
@@ -827,14 +1088,49 @@ def write_schematic(netlist: dict, bom: dict, output_path, symbols_dir,
             endpoint_cells.add(_to_grid(_e[2], _e[3]))
         if _job["flag"]:
             endpoint_cells.add(_to_grid(_job["flag"][0], _job["flag"][1]))
+    # 菱形本体在引脚点上方 2 格；登记为硬障碍，但真实端点格必须可达。
+    flag_body_cells = set()
     for _job in net_jobs:
         if not _job["flag"]:
             continue
         _gi, _gj = _to_grid(_job["flag"][0], _job["flag"][1])
-        for _dj in (1, 2):
+        for _dj in (0, 1, 2):
             _c = (_gi, _gj - _dj)
             if _c not in endpoint_cells:
+                flag_body_cells.add(_c)
                 blocked.add(_c)
+
+    # ⑤ 通用标签避让：同一网络只挂一个标签，其余端点靠导线连接。
+    #    标签锚点默认在 stub 末端；若与别的标签 / 元件文字 / 旗标 / 符号本体
+    #    重叠，就沿本网 stub 往引脚方向退 1~3 格（仍在该网络的导线上，
+    #    电气不变）。这是对**所有**网络统一执行的检查。
+    label_plan = {}
+    visual_taken = set(property_cells) | flag_body_cells
+    for job in net_jobs:
+        touched = sorted(job["touched"])
+        primary = touched[0] if touched else 0
+        for i, (ax, ay, ex, ey, odx, ody) in enumerate(job["ends"]):
+            if i != primary and i in touched:
+                continue
+            angle = 180 if odx > 0 else 0
+            ga, gb = _to_grid(ax, ay), _to_grid(ex, ey)
+            sdx = (ga[0] > gb[0]) - (ga[0] < gb[0])
+            sdy = (ga[1] > gb[1]) - (ga[1] < gb[1])
+            max_step = min(3, abs(ga[0] - gb[0]) + abs(ga[1] - gb[1]))
+            chosen = None
+            for k in range(max_step + 1):
+                cell = (gb[0] + sdx * k, gb[1] + sdy * k)
+                cells = _text_cells(cell, job["name"], angle)
+                if any(c in visual_taken or c in blocked for c in cells):
+                    continue
+                chosen = (cell, cells)
+                break
+            if chosen is None:
+                chosen = (gb, _text_cells(gb, job["name"], angle))
+            cell, cells = chosen
+            lx, ly = _from_grid(*cell)
+            label_plan[(job["key"], i)] = (lx, ly, angle, cells)
+            visual_taken.update(cells)
 
     # ④ 预先登记各网络的引出线与端点。
     #    关键：引脚引出线（stub）整段都要登记！过去只登记端点 (ex,ey)，
@@ -844,50 +1140,147 @@ def write_schematic(netlist: dict, bom: dict, output_path, symbols_dir,
     # 与旧的硬 owner 不同：完整线段的每一格都登记，穿越要付 CROSS_COST，
     # 但不是硬墙——密集区不会因为被封死而断线（旧硬墙方案标签 24→38）。
     soft = {}
-    hard = {}   # 各网络的真实端点（含 stub 两端、PWR_FLAG）：别的网络不可穿越
+    # hard 是「异网绝对不可落脚」的电气锚点集合。过去只把 stub 两端和
+    # PWR_FLAG 脚放进 hard，而网络标签锚点和 stub_trim 收口点都落在 stub
+    # **中段**：其它网络的走线可以穿过这些点，KiCad 会把异名标签接到同一
+    # 条线上，触发 multiple_net_names（8051 上 NET1/NET6、NET17/NET19 就是
+    # 这样串到一起的）。这里把整段 stub 都登记为异网硬障碍，覆盖所有可能
+    # 的标签/收口锚点；本网自己仍可通行。
+    hard = {}
+    # edges/vertices 记录「已画导线」的独占关系：异网不能复用同一段，
+    # 也不能在对方拐点/端点落脚（十字交叉仍允许，因为只共用中段格点）。
+    edge_owner = {}     # 无向边 -> {key}
+    vertex_owner = {}   # 拐点/端点格 -> {key}
+
+    def _cells_between(a, b):
+        """栅格 a→b 的水平/垂直线段包含的所有格点。"""
+        if a[0] == b[0]:
+            step = 1 if b[1] >= a[1] else -1
+            return [(a[0], j) for j in range(a[1], b[1] + step, step)]
+        step = 1 if b[0] >= a[0] else -1
+        return [(i, a[1]) for i in range(a[0], b[0] + step, step)]
 
     def _occupy(key, a, b):
         """把栅格 a→b 的水平/垂直线段登记到 soft。"""
-        if a[0] == b[0]:
-            step = 1 if b[1] >= a[1] else -1
-            cells = [(a[0], j) for j in range(a[1], b[1] + step, step)]
-        else:
-            step = 1 if b[0] >= a[0] else -1
-            cells = [(i, a[1]) for i in range(a[0], b[0] + step, step)]
-        for c in cells:
+        for c in _cells_between(a, b):
             soft.setdefault(c, set()).add(key)
 
-    # 引脚引出线（stub）全程登记：别的网络横穿它要付代价（少交叉），
-    # 但真绕不开时仍能穿（保连通），自家网络穿越不罚。
+    # 引脚引出线（stub）全程登记：soft 用于少交叉；hard 用于阻止异网
+    # 在 stub 中段落点（标签、收口点都在这里），从源头杜绝异名标签串网。
     for key, job in enumerate(net_jobs):
         for e in job["ends"]:
             ga, gb = _to_grid(e[0], e[1]), _to_grid(e[2], e[3])
             _occupy(key, ga, gb)
-            # 引脚端与 stub 末端都是电气连接点，设为硬障碍
-            for c in (ga, gb):
+            for c in _cells_between(ga, gb):
                 hard.setdefault(c, set()).add(key)
+            edge_owner.setdefault(_edge_key(ga, gb), set()).add(key)
+            vertex_owner.setdefault(ga, set()).add(key)
+            vertex_owner.setdefault(gb, set()).add(key)
         if job["flag"]:
             fc = _to_grid(job["flag"][0], job["flag"][1])
             soft.setdefault(fc, set()).add(key)
             hard.setdefault(fc, set()).add(key)
+            vertex_owner.setdefault(fc, set()).add(key)
+
+    # 元件文字与网络标签统一作为“视觉软障碍”登记：走线能绕则绕，绕不开
+    # 仍可穿越（保连通）。-1 是图形占位哨兵，不属于任何真实网络。
+    for c in property_cells:
+        soft.setdefault(c, set()).add(-1)
+    for _plan in label_plan.values():
+        for c in _plan[3]:
+            soft.setdefault(c, set()).add(-1)
 
     def _commit(key, path):
-        path = _shorten_path(path, blocked, soft, hard, key)
+        path = _shorten_path(path, blocked, soft, hard, key,
+                             edge_owner, vertex_owner)
         for (x1, y1), (x2, y2) in _compress_segments(path):
             if (x1, y1) != (x2, y2):
-                _occupy(key, _to_grid(x1, y1), _to_grid(x2, y2))
-                _wire(x1, y1, x2, y2)
+                ga, gb = _to_grid(x1, y1), _to_grid(x2, y2)
+                _occupy(key, ga, gb)
+                _wire(x1, y1, x2, y2, key)
+                edge_owner.setdefault(_edge_key(ga, gb), set()).add(key)
+                vertex_owner.setdefault(ga, set()).add(key)
+                vertex_owner.setdefault(gb, set()).add(key)
+
+    stub_trim = {}   # (net_key, end_idx) -> 收口后的 stub 末端坐标
 
     def _mst_route(key, job, pts):
         end_cells = set(pts)
         if job["flag"]:
             end_cells.add(_to_grid(job["flag"][0], job["flag"][1]))
-        for a, b in _mst_edges(pts):
-            path = _route_path(pts[a], pts[b], blocked, soft, hard, key, nx, ny, end_cells)
+
+        # 第一步：先算出所有边，并找出「从引脚引出线中途接入」的收口点。
+        # 必须两遍处理：同一个引出线末端可能连着多条 MST 边，只收口其中一条
+        # 会让另一条悬空（曾导致 ERC wire_dangling）。
+        edges = list(_mst_edges(pts))
+        paths = {}
+        candidates = {}
+        for a, b in edges:
+            path = _route_path(pts[a], pts[b], blocked, soft, hard, key, nx, ny,
+                               end_cells, edge_owner, vertex_owner)
             if not path:
                 continue                       # 走不通时仍保留网络标签兜底
+            paths[(a, b)] = path
+            for idx, at_start in ((a, True), (b, False)):
+                if idx >= len(job["ends"]) or len(path) < 2:
+                    continue
+                endpoint = path[0] if at_start else path[-1]
+                neighbor = path[1] if at_start else path[-2]
+                if endpoint != pts[idx]:
+                    continue
+                ax, ay, ex, ey, _odx, _ody = job["ends"][idx]
+                ga, gb = _to_grid(ax, ay), _to_grid(ex, ey)
+                inside = ((ga[0] == gb[0] == neighbor[0]
+                           and min(ga[1], gb[1]) < neighbor[1] < max(ga[1], gb[1]))
+                          or (ga[1] == gb[1] == neighbor[1]
+                              and min(ga[0], gb[0]) < neighbor[0] < max(ga[0], gb[0])))
+                if inside:
+                    candidates.setdefault(idx, []).append(neighbor)
+
+        # 同一末端有多个接入点时，收口到离引脚最远的那个，保留最多连线。
+        targets = {}
+        for idx, cells in candidates.items():
+            ga = _to_grid(job["ends"][idx][0], job["ends"][idx][1])
+            target = max(cells, key=lambda c: abs(c[0] - ga[0]) + abs(c[1] - ga[1]))
+            targets[idx] = target
+            stub_trim[(key, idx)] = _from_grid(*target)
+
+        # 第二步：把所有连到该末端的路径都改接到收口点。
+        for (a, b), path in paths.items():
             job["touched"].update((a, b))
-            _commit(key, path)
+            for idx, at_start in ((a, True), (b, False)):
+                if idx not in targets or len(path) < 2:
+                    continue
+                target = targets[idx]
+                original = pts[idx]
+                if at_start:
+                    prev = path[1]
+                    if prev == target:
+                        path = path[1:]
+                    elif abs(prev[0] - target[0]) + abs(prev[1] - target[1]) == 1:
+                        path[0] = target
+                    else:
+                        extra = set(blocked) | {original}
+                        rp = _route_path(prev, target, extra, soft, hard, key,
+                                         nx, ny, end_cells | {target},
+                                         edge_owner, vertex_owner)
+                        if rp and len(rp) >= 2:
+                            path = rp[::-1] + path[1:]
+                else:
+                    prev = path[-2]
+                    if prev == target:
+                        path = path[:-1]
+                    elif abs(prev[0] - target[0]) + abs(prev[1] - target[1]) == 1:
+                        path[-1] = target
+                    else:
+                        extra = set(blocked) | {original}
+                        rp = _route_path(prev, target, extra, soft, hard, key,
+                                         nx, ny, end_cells | {target},
+                                         edge_owner, vertex_owner)
+                        if rp and len(rp) >= 2:
+                            path = path[:-2] + rp
+            if len(path) >= 2:
+                _commit(key, path)
 
     # 布线顺序：端点多的网络先走、同等规模下总长度短的优先。
     # 实测大网（VCC/GND）先占好主干，小网绕行，比小网先走少几处交叉。
@@ -906,30 +1299,328 @@ def write_schematic(netlist: dict, bom: dict, output_path, symbols_dir,
 
     # ⑥ 输出引出线、标签和 PWR_FLAG。
     # 已用导线连通的网络只挂一个标签；未接通的端点保留标签兜底。
-    junc_pts = set()   # 引脚电气连接点：加实心圆点，明确「线接在这里」
+
+    def _stub_early_tap(ax, ay, bx, by, key):
+        """stub 段 ax→bx 上若有「同网导线的接入点」落在其严格内部，
+        返回其中最靠近引脚(ax)的那个点。stub 应收口到这里：
+        否则 junction 画在接入点，stub 却继续伸到原末端，形成一小段悬空线头
+        （截图里 20 针排针每个引脚旁多出的那一截）。
+
+        接入点 = 同网导线段的端点，且该端点严格位于 stub 两端之间。
+        """
+        EPS = 1e-6
+        vert = abs(ax - bx) < EPS
+        taps = []
+        for x1, y1, x2, y2, k in wire_segments:
+            if k != key:
+                continue
+            for px, py in ((x1, y1), (x2, y2)):
+                if vert:
+                    if abs(px - ax) < EPS and min(ay, by) + EPS < py < max(ay, by) - EPS:
+                        taps.append((px, py))
+                else:
+                    if abs(py - ay) < EPS and min(ax, bx) + EPS < px < max(ax, bx) - EPS:
+                        taps.append((px, py))
+        if not taps:
+            return None
+        # 取最靠近引脚的接入点
+        return min(taps, key=lambda p: abs(p[0] - ax) + abs(p[1] - ay))
+
+    # ⑥b 最终标签文字方向再优化。label_plan 的避让发生在 stub_trim/early
+    #     tap 之前，锚点后来挪到导线中段后原避让会失效（abecba76 的 VCC/V3
+    #     只差 2.54mm、文字却要 3.175mm）。锚点**不能**沿导线挪：路由线是
+    #     按原接入点算的，一挪就会留下悬空线头。所以只改文字方向，用全局
+    #     局部搜索 minimization 总重叠数，锚点与走线都不动。
+    label_items = []
     for job in net_jobs:
-        name = job["name"]
-        for ax, ay, ex, ey, odx, ody in job["ends"]:
-            _wire(ax, ay, ex, ey)
-            junc_pts.add((round(ax, 3), round(ay, 3)))
         touched = sorted(job["touched"])
         primary = touched[0] if touched else 0
         for i, (ax, ay, ex, ey, odx, ody) in enumerate(job["ends"]):
-            if i != primary and i in job["touched"]:
+            if i != primary and i in touched:
                 continue
-            langle = 180 if odx > 0 else 0
+            lx, ly, angle, _cells = label_plan[(job["key"], i)]
+            if (job["key"], i) in stub_trim:
+                lx, ly = stub_trim[(job["key"], i)]
+            _tex, _tey = stub_trim.get((job["key"], i), (ex, ey))
+            _tap = _stub_early_tap(ax, ay, _tex, _tey, job["key"])
+            if _tap is not None:
+                lx, ly = _tap
+            orig = 90 if angle in (90, 270) else angle
+            ga, gb = _to_grid(ax, ay), _to_grid(lx, ly)
+            cells = list(_cells_between(ga, gb))
+            cells.reverse()          # 从锚点往引脚方向，锚点始终在已画导线上
+            cands = [(gb, a) for a in (orig, 90)]
+            label_items.append({"key": (job["key"], i), "text": job["name"],
+                                "x": lx, "y": ly, "cell": gb,
+                                "orig": orig, "angle": orig, "cands": cands})
+
+    _CHAR_W, _TEXT_H = 1.27, 1.27
+    fixed_boxes = []
+    for p in prop_texts:
+        w = max(1, len(p["text"])) * _CHAR_W
+        fixed_boxes.append((p["x"] - w / 2, p["y"] - _TEXT_H / 2,
+                            p["x"] + w / 2, p["y"] + _TEXT_H / 2))
+
+    def _label_box(lab):
+        w = max(1, len(lab["text"])) * _CHAR_W
+        if lab["angle"] == 90:
+            return (lab["x"] - _TEXT_H / 2, lab["y"] - w / 2,
+                    lab["x"] + _TEXT_H / 2, lab["y"] + w / 2)
+        return (lab["x"] - w / 2, lab["y"] - _TEXT_H / 2,
+                lab["x"] + w / 2, lab["y"] + _TEXT_H / 2)
+
+    def _overlap(a, b):
+        tol = 0.01
+        return not (a[2] <= b[0] + tol or b[2] <= a[0] + tol
+                    or a[3] <= b[1] + tol or b[3] <= a[1] + tol)
+
+    def _total_clash():
+        boxes = [_label_box(lab) for lab in label_items]
+        cost = sum(_overlap(b, f) for b in boxes for f in fixed_boxes)
+        for i in range(len(boxes)):
+            for j in range(i + 1, len(boxes)):
+                if _overlap(boxes[i], boxes[j]):
+                    cost += 1
+        return cost
+
+    def _apply(lab, cand):
+        lab["cell"], lab["angle"] = cand
+        lab["x"], lab["y"] = _from_grid(*cand[0])
+
+    for _pass in range(6):
+        changed = False
+        for lab in label_items:
+            before = _total_clash()
+            best = ((lab["cell"], lab["angle"]), before)
+            for cand in lab["cands"]:
+                _apply(lab, cand)
+                cost = _total_clash()
+                if cost < best[1]:
+                    best = (cand, cost)
+            _apply(lab, best[0])
+            if best[1] < before:
+                changed = True
+        if not changed:
+            break
+
+    final_label_plan = {}
+    for lab in label_items:
+        final_label_plan[lab["key"]] = (
+            lab["x"], lab["y"], lab["angle"],
+            _text_cells(_to_grid(lab["x"], lab["y"]), lab["text"], lab["angle"]))
+
+    junc_pts = set()   # 引脚电气连接点：加实心圆点，明确「线接在这里」
+    emitted_labels = set()   # 真正写出的标签锚点（stub_trim 后可能已挪位）
+    for job in net_jobs:
+        name = job["name"]
+        key = job["key"]
+        touched = sorted(job["touched"])
+        primary = touched[0] if touched else 0
+        for i, (ax, ay, ex, ey, odx, ody) in enumerate(job["ends"]):
+            # 通用线头消除：如果这条引出线没有被任何走线接入，而本网的
+            # 标签又挂在别的端点上，这截短线就是悬空「线头」——不画。
+            if touched and i not in touched:
+                continue
+            tex, tey = stub_trim.get((key, i), (ex, ey))
+            # stub 中途若有同网导线接入，收口到最靠引脚的接入点
+            tap = _stub_early_tap(ax, ay, tex, tey, key)
+            if tap is not None:
+                tex, tey = tap
+            _wire(ax, ay, tex, tey, key)
+            # 不在这里给引脚端点加圆点：单根线接到引脚是正常连接，画圆点只会
+            # 让「圆点 + stub 横线 + 引脚红线」看起来像多伸出一截的线头。
+            # 是否画圆点统一交给下面的 T 型汇聚检测（≥3 线或端点顶在中段）。
+        for i, (ax, ay, ex, ey, odx, ody) in enumerate(job["ends"]):
+            if i != primary and i in touched:
+                continue
+            # 锚点与角度已由 ⑥b 按最终 stub/early-tap 位置统一排过重叠
+            lx, ly, langle, _cells = final_label_plan[(key, i)]
             L.append(f'  (label "{name}"')
-            L.append(f"    (at {_fmt(ex)} {_fmt(ey)} {langle})")
+            L.append(f"    (at {_fmt(lx)} {_fmt(ly)} {langle})")
             L.append('    (effects (font (size 1.27 1.27)))')
             L.append(f'    (uuid "{_u()}")')
             L.append("  )")
+            # 登记真实标签锚点：线头裁剪要用它保护「导线恰好终止于标签」的
+            # 端点。过去这个集合定义了却从不 add，等于标签端点毫无保护。
+            emitted_labels.add((round(lx, 3), round(ly, 3)))
         if job["flag"]:
             fx, fy, fref = job["flag"]
             _emit_symbol(fref, "power:PWR_FLAG", fx, fy,
                          {1: (0.0, 0.0, 90.0)}, "PWR_FLAG", in_bom="no",
                          hide_text=True)
 
-    # 引脚电气连接点画实心圆点（junction）：纯视觉标记，让「导线确实接到了
+    # 通用「线头」清理：所有导线画完后，若某段的末端既不是引脚、标签、
+    # junction，也没有别的导线接上，而这段又很短（≤3 格），它就是截图里
+    # 那种多伸出来的线头——直接裁掉。级联处理，直到没有新的短线头出现。
+    from collections import Counter as _Counter
+    pin_pts = {(round(e[0], 3), round(e[1], 3))
+               for _j in net_jobs for e in _j["ends"]}
+    # PWR_FLAG 的短引出线绝不能裁：裁掉后 ERC 会报 power_pin_not_driven。
+    pin_pts |= {(round(_j["flag"][0], 3), round(_j["flag"][1], 3))
+                for _j in net_jobs if _j["flag"]}
+    label_pts = emitted_labels
+
+    # 引脚引出线若「穿过」本网标签锚点又继续往外伸，标签外侧那一格就是
+    # 视觉线头（ERC 仍通过，因为标签在导线中段已连通）。把这样的 stub 在
+    # 标签锚点处劈成两段：标签侧正常接线，外侧段随后被下面的短段裁剪移除。
+    # 只劈「一端是引脚、锚点严格落在其内部且共线」的段，绝不碰走线中段。
+    def _split_at_label():
+        EPS = 1e-6
+        changed = False
+        out = []
+        for x1, y1, x2, y2, k in wire_segments:
+            a = (round(x1, 3), round(y1, 3))
+            b = (round(x2, 3), round(y2, 3))
+            if a not in pin_pts and b not in pin_pts:
+                out.append((x1, y1, x2, y2, k))
+                continue
+            horiz = abs(y1 - y2) < EPS
+            vert = abs(x1 - x2) < EPS
+            if not (horiz or vert):
+                out.append((x1, y1, x2, y2, k))
+                continue
+            # 落在该段严格内部、且共线的标签锚点
+            cuts = []
+            for lp in emitted_labels:
+                if horiz:
+                    if abs(lp[1] - y1) < EPS and min(x1, x2) + EPS < lp[0] < max(x1, x2) - EPS:
+                        cuts.append(lp[0])
+                else:
+                    if abs(lp[0] - x1) < EPS and min(y1, y2) + EPS < lp[1] < max(y1, y2) - EPS:
+                        cuts.append(lp[1])
+            if not cuts:
+                out.append((x1, y1, x2, y2, k))
+                continue
+            cuts.sort(reverse=(x1 > x2 or y1 > y2))
+            pts = [(x1, y1)] + [((c, y1) if horiz else (x1, c)) for c in cuts] + [(x2, y2)]
+            for u, v in zip(pts, pts[1:]):
+                out.append((u[0], u[1], v[0], v[1], k))
+            changed = True
+        if changed:
+            wire_segments[:] = out
+        return changed
+
+    _split_at_label()
+    for _ in range(len(wire_segments) + 1):
+        deg = _Counter()
+        for x1, y1, x2, y2, _k in wire_segments:
+            deg[(round(x1, 3), round(y1, 3))] += 1
+            deg[(round(x2, 3), round(y2, 3))] += 1
+        valid = (pin_pts | label_pts
+                 | {(round(x, 3), round(y, 3)) for x, y in junc_pts}
+                 | {p for p, n in deg.items() if n >= 2})
+        drop = []
+        for seg in wire_segments:
+            x1, y1, x2, y2, _k = seg
+            if abs(x1 - x2) + abs(y1 - y2) > 3 * GRID + 1e-6:
+                continue
+            for p in ((round(x1, 3), round(y1, 3)), (round(x2, 3), round(y2, 3))):
+                if deg[p] == 1 and p not in valid:
+                    drop.append(seg)
+                    break
+        if not drop:
+            break
+        for seg in drop:
+            if seg in wire_segments:
+                wire_segments.remove(seg)
+    # 直接输出裁剪后的 wire_segments：它已是去重全集，且含标签锚点劈出的
+    # 子段；绕 wire_buffer 反而会漏掉子段、留下被裁的整段。
+    for x1, y1, x2, y2, key in wire_segments:
+        L.append("  (wire")
+        L.append("    (pts")
+        L.append(f"      (xy {_fmt(x1)} {_fmt(y1)}) (xy {_fmt(x2)} {_fmt(y2)})")
+        L.append("    )")
+        L.append('    (stroke (width 0) (type solid))')
+        L.append(f'    (uuid "{_u()}")')
+        L.append("  )")
+
+    # 通用 T 型接点检测：一段导线末端顶在另一段**同网**导线中段，或三段以上
+    # 同网导线汇聚时，KiCad 电气上已连通，但缺少 junction 圆点会看成“线头”
+    # （截图里 PWR_FLAG 接到主干、GND 接到稳压器引脚引出线处都属此类）。
+    # 普通转角/两段直通不加圆点，避免图纸上到处是点。
+    EPS = 1e-6
+
+    def _is_endpoint(p, seg):
+        x, y = p
+        x1, y1, x2, y2, _k = seg
+        return ((abs(x - x1) < EPS and abs(y - y1) < EPS)
+                or (abs(x - x2) < EPS and abs(y - y2) < EPS))
+
+    def _is_strict_inside(p, seg):
+        x, y = p
+        x1, y1, x2, y2, _k = seg
+        if abs(x1 - x2) < EPS:
+            return (abs(x - x1) < EPS
+                    and min(y1, y2) + EPS < y < max(y1, y2) - EPS)
+        if abs(y1 - y2) < EPS:
+            return (abs(y - y1) < EPS
+                    and min(x1, x2) + EPS < x < max(x1, x2) - EPS)
+        return False
+
+    def _is_redundant_seg(seg):
+        """段 seg 是否被另一条「同网、共线」段完全覆盖（冗余重画）。
+
+        同一网络多条 MST 边各自寻路时会共用主干，画出互相覆盖的水平/竖直线
+        段。被覆盖段的端点落在长段中段，会被 T 接检测误判成 junction（右下
+        角多出的圆点、密脚区线头都源于此）。这类段识别出来后，其端点不作为
+        T 接证据——真正的 T 接（垂直线接入主干）不会被判为冗余。
+        """
+        x1, y1, x2, y2, key = seg
+        if key is None:
+            return False
+        horiz = abs(y1 - y2) < EPS
+        vert = abs(x1 - x2) < EPS
+        if not (horiz or vert):
+            return False
+        lo, hi = (min(x1, x2), max(x1, x2)) if horiz else (min(y1, y2), max(y1, y2))
+        for X1, Y1, X2, Y2, k2 in wire_segments:
+            if k2 != key or (X1, Y1, X2, Y2) == (x1, y1, x2, y2):
+                continue
+            if horiz:
+                if abs(Y1 - Y2) < EPS and abs(Y1 - y1) < EPS:
+                    if min(X1, X2) <= lo + EPS and max(X1, X2) >= hi - EPS \
+                            and (max(X1, X2) - min(X1, X2)) > (hi - lo) + EPS:
+                        return True
+            else:
+                if abs(X1 - X2) < EPS and abs(X1 - x1) < EPS:
+                    if min(Y1, Y2) <= lo + EPS and max(Y1, Y2) >= hi - EPS \
+                            and (max(Y1, Y2) - min(Y1, Y2)) > (hi - lo) + EPS:
+                        return True
+        return False
+
+    probe_pts = set()
+    for x1, y1, x2, y2, _k in wire_segments:
+        probe_pts.add((x1, y1))
+        probe_pts.add((x2, y2))
+    for p in probe_pts:
+        touching = [seg for seg in wire_segments
+                    if seg[4] is not None
+                    and (_is_endpoint(p, seg) or _is_strict_inside(p, seg))]
+        if len(touching) < 2:
+            continue
+        # 关键：只有汇聚导线**全部属于同一网络**才是真接点。不同网络的导线
+        # 几何交叉（如 VOUT 竖线穿过 GND 水平线）绝不能画 junction 圆点，
+        # 否则视觉上像把两个网络短接，误导阅读（电气上 KiCad 并未相连）。
+        # 注意还要检查「异网线段的中段正好穿过本网接点」：KiCad 的 junction
+        # 会把穿过它的所有线都连起来，画点就等于主动把异网短接。
+        keys = {seg[4] for seg in touching}
+        if len(keys) != 1:
+            continue
+        foreign = [seg for seg in wire_segments
+                   if seg[4] is not None and seg[4] != next(iter(keys))
+                   and (_is_endpoint(p, seg) or _is_strict_inside(p, seg))]
+        if foreign:
+            continue
+        # 被同网长段完全覆盖的冗余段：其端点不作为 T 接证据（伪接点）。
+        effective = [seg for seg in touching
+                     if not (_is_endpoint(p, seg) and _is_redundant_seg(seg))]
+        has_endpoint = any(_is_endpoint(p, seg) for seg in effective)
+        has_inside = any(_is_strict_inside(p, seg) for seg in effective)
+        if len(effective) >= 3 or (has_endpoint and has_inside):
+            junc_pts.add((round(p[0], 3), round(p[1], 3)))
+
+    # 引脚电气连接点与 T 型接点画实心圆点（junction）：纯视觉标记，让「导线
+    # 确实接到了这里」一眼可见，消除线头观感。不改电气连接，ERC 不受影响。
     # 针脚」一眼可见，消除 stub 末端那种「悬空线头」的观感。不改电气连接，
     # ERC 不检查 junction 是否必要，因此不会影响违规数。多脚同坐标会去重。
     for jx, jy in sorted(junc_pts):

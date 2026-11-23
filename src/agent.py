@@ -4,7 +4,7 @@ import re
 from pathlib import Path
 from .bom_generator import generate_bom
 from .netlist_generator import generate_netlist
-from .config import kicad_symbols_dir
+from .config import find_kicad_symbols_dir
 from .symbol_lib import SymbolLib
 from .safety import check_electrical
 
@@ -116,16 +116,13 @@ class Agent:
                 self.llm = None
         # 符号库是本地 KiCad 资源，与 LLM/密钥无关；mock 模式也要加载，
         # 这样离线演示也能「更换型号」（find_exact_symbol 需要它）。
-        for d in filter(None, [
-            (kicad_symbols_dir(cfg) if cfg else None),
-            Path(r"C:/Users/Gray/AppData/Local/Programs/KiCad/8.0/share/kicad/symbols"),
-        ]):
-            try:
-                if Path(d).exists():
-                    self.symbol_lib = SymbolLib(d)
-                    break
-            except Exception:
-                self.symbol_lib = None
+        # 自动探测（配置 → 环境变量 → PATH → 各平台默认路径），不写死本机路径。
+        try:
+            sym_dir = find_kicad_symbols_dir(cfg)
+            if sym_dir is not None:
+                self.symbol_lib = SymbolLib(sym_dir)
+        except Exception:
+            self.symbol_lib = None
         self.state = {"bom": None, "netlist": None, "history": [], "warnings": []}
 
     def design(self, prompt: str):

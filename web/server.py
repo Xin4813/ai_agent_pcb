@@ -27,28 +27,18 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from src.config import load_config, kicad_symbols_dir          # noqa: E402
+from src.config import load_config, find_kicad_symbols_dir, find_kicad_cli  # noqa: E402
 from src.agent import Agent                                    # noqa: E402
 from src.kicad_writer import write_schematic                    # noqa: E402
+from src.visual_check import check as check_visual              # noqa: E402
+from src.functional_check import check_functional                # noqa: E402
 
 INDEX = Path(__file__).resolve().parent / "index.html"
 
 
 def _kicad_cli(cfg) -> str | None:
-    """推导 kicad-cli 可执行文件路径；找不到返回 None（调用方优雅降级）。"""
-    if cfg:
-        inst = cfg.get("kicad", {}).get("install_dir", "")
-        if inst:
-            cand = Path(inst) / "bin" / "kicad-cli.exe"
-            if cand.exists():
-                return str(cand)
-            cand = Path(inst) / "bin" / "kicad-cli"
-            if cand.exists():
-                return str(cand)
-    for name in ("kicad-cli", "kicad-cli.exe"):
-        if os.system(f"where {name} >nul 2>nul") == 0 or os.system(f"command -v {name} >/dev/null 2>&1") == 0:
-            return name
-    return None
+    """探测 kicad-cli 可执行文件路径；找不到返回 None（调用方优雅降级）。"""
+    return find_kicad_cli(cfg)
 
 
 def _run(cmd) -> dict:
@@ -135,20 +125,30 @@ _SESSIONS_LOCK = threading.Lock()
 
 
 def _new_out_dir() -> Path:
-    out_dir = Path(os.environ.get("PCB_WEB_OUT") or (ROOT / "examples" / "output"))
+    """每次网页生成都用独立目录，绝不再覆盖 examples/output 里的示例数据。
+
+    过去这里直接返回 examples/output，任何一次网页请求（包括误点离线模式）都会
+    把精心核对过的 8051 BOM/网表覆盖成别的芯片，接着用户在页面上看到 AVR 符号
+    配 8051 项目名。现在默认落到 examples/output/web_sessions/<短 UUID>/，
+    示例目录只读作参考；需要指定根路径时可用 PCB_WEB_OUT 覆盖。
+    """
+    base = Path(os.environ.get("PCB_WEB_OUT") or (ROOT / "examples" / "output" / "web_sessions"))
+    out_dir = base / uuid.uuid4().hex[:8]
     out_dir.mkdir(parents=True, exist_ok=True)
     return out_dir
 
 
 def _sym_dir(cfg) -> str:
-    if cfg:
-        try:
-            d = kicad_symbols_dir(cfg)
-            if d.exists():
-                return str(d)
-        except Exception:
-            pass
-    return r"C:/Users/Gray/AppData/Local/Programs/KiCad/8.0/share/kicad/symbols"
+    """探测 KiCad 符号库目录；非标准安装可用 KICAD_SYMBOL_DIR 环境变量指定。"""
+    try:
+        d = find_kicad_symbols_dir(cfg)
+        if d is not None:
+            return str(d)
+    except Exception:
+        pass
+    raise RuntimeError(
+        "未找到 KiCad 符号库目录。请安装 KiCad 8，或设置环境变量 KICAD_SYMBOL_DIR 指向 symbols 目录。"
+    )
 
 
 def _render_and_package(ctx: dict, autofix: bool, max_fix: int = 2) -> dict:
@@ -161,7 +161,6 @@ def _render_and_package(ctx: dict, autofix: bool, max_fix: int = 2) -> dict:
     out_dir, sym_dir, name = ctx["out_dir"], ctx["sym_dir"], ctx["name"]
 
     (out_dir / "bom.json").write_text(json.dumps(bom, ensure_ascii=False, indent=2), encoding="utf-8")
-    (out_dir / "netlist.json").write_text(json.dumps(netlist, ensure_ascii=False, indent=2), encoding="utf-8")
 
     sch = write_schematic(netlist, bom, out_dir / "schematic" / f"{name}.kicad_sch", sym_dir)
 
@@ -183,12 +182,57 @@ def _render_and_package(ctx: dict, autofix: bool, max_fix: int = 2) -> dict:
         if not ok or nl is None:
             loop.append({"iter": i, "note": "LLM 修订失败，停止闭环"})
             break
-        (out_dir / "netlist.json").write_text(json.dumps(nl, ensure_ascii=False, indent=2), encoding="utf-8")
-        sch = write_schematic(nl, bom, sch, sym_dir)
+        # revise_erc 让 LLM 重新生成了「整份」网表，可能把初次设计的拓扑修正
+        # （LED 限流 / 5V 直灌 / USB 反接等）又改回去。用局部变量跟踪最终网表。
+        netlist = nl
+        sch = write_schematic(netlist, bom, sch, sym_dir)
+
+    # 关键：拓扑纠错必须在「最终」网表上做。过去只在 Agent.design() 里做一次，
+    # ERC 闭环一旦重新生成网表就把修正覆盖，导致网页仍提示「已修正」而网表
+    # 实际是错的（LED 直连电源、提示说用了 R1 实际是 EN 上拉）。这里重跑一次：
+    # 已修好的不会重复修（幂等），被覆盖的会重新修，文案与最终网表严格一致。
+    from src.circuit_fix import fix_topology
+    # 功能闭环：拓扑修复迭代到收敛。某些修复会为后续规则创造条件
+    # （如先分离 VBUS 再拆 3.3V、先补限流电阻再判 GPIO），单次可能留下
+    # 可被下一轮修掉的问题。fix_topology 幂等，收敛后返回空即停。
+    fixes: list[str] = []
+    for _ in range(3):
+        round_fixes = fix_topology(bom, netlist, agent.symbol_lib)
+        if not round_fixes:
+            break
+        fixes.extend(round_fixes)
+    if fixes:
+        agent.state["topology_fixes"] = fixes
+    agent.state["netlist"] = netlist
+    agent._refresh_warnings()
+    (out_dir / "netlist.json").write_text(json.dumps(netlist, ensure_ascii=False, indent=2), encoding="utf-8")
+    # 拓扑变了必须重画原理图，否则 SVG/ERC 还是修正前的连线。
+    sch = write_schematic(netlist, bom, sch, sym_dir)
+    last_erc = run_erc(sch, cli)
+
+    # 视觉重叠自检（排版层，与 ERC 电气层互补）：文字互压、导线穿文字/符号/
+    # 旗标、旗标互压、标题栏侵入、导线十字交叉。生成后自动跑，结果随响应返回，
+    # 让排版问题像 ERC 一样每次都可见，不必靠人工截图发现。
+    try:
+        visual = check_visual(sch)
+    except Exception as exc:                       # 自检失败不影响主流程
+        visual = {"ok": True, "issues": [], "error_count": 0,
+                  "info_count": 0, "check_error": str(exc)}
+
+    # 功能性自检（ERC/视觉/safety 之外的最后一道关）：让网页自己回答
+    # 「这次功能上对吗」，不再靠用户逐张截图发现硬件不工作的问题。
+    # 只读检查，不修改网表；发现的问题若能被规则修复，应已在上面的 fix_topology
+    # 处理，这里剩下的都是需要提示人工核对的硬不变量。
+    try:
+        functional = check_functional(bom, netlist, agent.symbol_lib)
+    except Exception as exc:
+        functional = {"ok": True, "issues": [], "checked": 0, "check_error": str(exc)}
 
     svg, svg_err = export_svg(sch, cli)
     return {
         "ok": True,
+        "visual": visual,
+        "functional": functional,
         "source": "LLM" if ctx.get("used") else "离线知识库",
         "prompt": ctx["prompt"],
         "bom": bom,
@@ -257,6 +301,11 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
+        # 服务器重启期间浏览器可能缓存了半加载的旧页面（表现为整页空白）。
+        # 全站禁用缓存，保证每次刷新都拿到最新 index.html / 接口结果。
+        self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+        self.send_header("Pragma", "no-cache")
+        self.send_header("Expires", "0")
         self.end_headers()
         if self.command != "HEAD":
             self.wfile.write(body)

@@ -1,5 +1,6 @@
 """步骤③：BOM + 需求 → 引脚级网表 JSON。LLM 生成 + 校验-重试闭环。"""
 from __future__ import annotations
+import copy
 import json
 import re
 from .knowledge import lookup_board
@@ -204,10 +205,14 @@ def _complete_interface_nets(nl: dict, board: dict | None) -> dict:
 def generate_netlist(prompt: str, bom: dict, llm=None, mock: bool = False, max_retries: int = 3,
                      symbol_lib=None, feedback: str = ""):
     board = lookup_board(prompt)
+    if board is not None and board.get("pinned"):
+        nl = copy.deepcopy(board["netlist"])
+        validate_netlist(nl, bom)   # 内置板卡数据同样要过校验（防数据本身有误）
+        return nl, False
     if mock or llm is None:
         if board is None:
             raise RuntimeError("离线模式且未匹配到内置板卡。")
-        nl = board["netlist"]
+        nl = copy.deepcopy(board["netlist"])
         validate_netlist(nl, bom)   # 内置板卡数据同样要过校验（防数据本身有误）
         return nl, False
 

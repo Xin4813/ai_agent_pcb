@@ -25,8 +25,12 @@ max_retries = 3
 keep_history = true
 
 [kicad]
-# KiCad 8 安装目录（你的实际路径，见下）。注意 TOML 里用正斜杠 /，
-# 不要直接贴 Windows 的反斜杠 \，否则配置文件会解析失败。
-install_dir = "C:/Users/Gray/AppData/Local/Programs/KiCad/8.0"
+# KiCad 安装根目录。留空即可——程序会自动探测符号库与 kicad-cli
+# （按 环境变量 → PATH → 各平台默认安装目录 的顺序）。
+# 只有装在非标准位置时才需要填，例如：
+#   Windows: install_dir = "C:/Program Files/KiCad/8.0"
+#   macOS:   install_dir = "/Applications/KiCad/KiCad.app/Contents/SharedSupport"
+# 注意 TOML 里用正斜杠 /，不要贴 Windows 的反斜杠 \，否则解析失败。
+install_dir = ""
 # 生成的 .kicad_sch 输出目录
 sch_output_dir = "examples/output/schematic"

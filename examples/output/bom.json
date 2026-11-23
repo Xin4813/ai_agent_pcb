@@ -1,69 +1,122 @@
 {
-  "project": "Arduino 最小系统板 (ATmega328P-PU)",
+  "project": "8051最小系统板",
   "items": [
     {
       "ref": "U1",
-      "name": "ATmega328P-PU",
-      "value": "ATmega328P-P",
+      "name": "AT89C51",
+      "value": "AT89C51",
       "qty": 1,
-      "symbol": "MCU_Microchip_ATmega:ATmega328P-P",
-      "footprint": "Package_DIP:DIP-28_W11.18mm"
+      "symbol": "MCU_Microchip_8051:AT89x51xxP",
+      "footprint": "Package_DIP:DIP-40_W15.24mm",
+      "desc": "真 8051 内核 40 脚 MCU"
     },
     {
       "ref": "Y1",
-      "name": "晶振 16MHz",
-      "value": "16MHz",
+      "name": "晶振",
+      "value": "11.0592MHz",
       "qty": 1,
       "symbol": "Device:Crystal",
-      "footprint": ""
+      "footprint": "",
+      "desc": "系统时钟"
     },
     {
       "ref": "C1",
-      "name": "瓷片电容 22pF",
-      "value": "22pF",
+      "name": "陶瓷电容",
+      "value": "30pF",
       "qty": 1,
       "symbol": "Device:C",
-      "footprint": ""
+      "footprint": "",
+      "desc": "晶振负载电容"
     },
     {
       "ref": "C2",
-      "name": "瓷片电容 22pF",
-      "value": "22pF",
+      "name": "陶瓷电容",
+      "value": "30pF",
       "qty": 1,
       "symbol": "Device:C",
-      "footprint": ""
+      "footprint": "",
+      "desc": "晶振负载电容"
     },
     {
       "ref": "C3",
-      "name": "去耦电容 100nF",
+      "name": "电解电容",
+      "value": "10uF",
+      "qty": 1,
+      "symbol": "Device:C",
+      "footprint": "",
+      "desc": "上电复位电容"
+    },
+    {
+      "ref": "C4",
+      "name": "陶瓷电容",
       "value": "100nF",
       "qty": 1,
       "symbol": "Device:C",
-      "footprint": ""
+      "footprint": "",
+      "desc": "电源去耦电容"
     },
     {
       "ref": "R1",
-      "name": "电阻 10kΩ",
+      "name": "电阻",
       "value": "10k",
       "qty": 1,
       "symbol": "Device:R",
-      "footprint": ""
+      "footprint": "",
+      "desc": "复位下拉电阻"
     },
     {
       "ref": "R2",
-      "name": "电阻 330Ω",
-      "value": "330",
+      "name": "电阻",
+      "value": "10k",
       "qty": 1,
       "symbol": "Device:R",
-      "footprint": ""
+      "footprint": "",
+      "desc": "EA 上拉电阻"
     },
     {
-      "ref": "D1",
-      "name": "LED 指示灯",
-      "value": "LED",
+      "ref": "SW1",
+      "name": "按键",
+      "value": "RESET",
       "qty": 1,
-      "symbol": "Device:LED",
-      "footprint": ""
+      "symbol": "Switch:SW_Push",
+      "footprint": "",
+      "desc": "手动复位按键"
+    },
+    {
+      "ref": "J1",
+      "name": "电源排针",
+      "value": "2P",
+      "qty": 1,
+      "symbol": "Connector:Conn_01x02_Pin",
+      "footprint": "",
+      "desc": "VCC/GND 电源输入"
+    },
+    {
+      "ref": "J2",
+      "name": "P0 排针",
+      "value": "8P",
+      "qty": 1,
+      "symbol": "Connector:Conn_01x08_Pin",
+      "footprint": "",
+      "desc": "P0.0~P0.7 扩展"
+    },
+    {
+      "ref": "J3",
+      "name": "P1 排针",
+      "value": "8P",
+      "qty": 1,
+      "symbol": "Connector:Conn_01x08_Pin",
+      "footprint": "",
+      "desc": "P1.0~P1.7 扩展"
+    },
+    {
+      "ref": "J4",
+      "name": "P2 排针",
+      "value": "8P",
+      "qty": 1,
+      "symbol": "Connector:Conn_01x08_Pin",
+      "footprint": "",
+      "desc": "P2.0~P2.7 扩展"
     }
   ]
 }

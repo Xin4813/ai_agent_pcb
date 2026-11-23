@@ -1,0 +1,137 @@
+"""生成后功能性自检（低误报）——ERC / 视觉 / safety 之外的最后一道关。
+
+设计目标：让网页每次生成都能自己回答「这次电路功能上对吗」，不再靠用户
+逐张截图、人工发现新问题。只报「物理上一定错」的硬不变量，刻意过滤
+芯片 NC/Modem/USB ID 等正常不接的脚，避免像早期 audit_functional 那样
+报一堆误报反而失去意义。
+
+返回结构化结果：{"ok": bool, "issues": [str], "checked": int}
+"""
+from __future__ import annotations
+import re
+from .safety import _pins, _GND_RE
+
+_SUPPLY_RE = re.compile(r"^(vcc|vdd|vbus|\+?\d+(?:\.\d+)?v|3v3|5v|vin)", re.I)
+
+# 这些脚悬空是正常的，不算功能性错误。
+_NORMAL_FLOAT = re.compile(
+    r"^(nc|id|suspend|wake|cts|rts|dtr|dsr|dcd|ri|test|reserved|"
+    r"n\.c\.?|not\s*connected)", re.I)
+
+
+def _is_normal_float_pin(pin_name: str) -> bool:
+    s = str(pin_name).strip()
+    # KiCad 反转信号写成 ~{DSR} / ~RI，先剥掉 ~ 与花括号再判定
+    s = s.strip("~").strip("{}").strip()
+    if s.upper().startswith("PIN_"):
+        return True          # 连接器通用脚名（如 USB ID=Pin_4），允许不接
+    return bool(_NORMAL_FLOAT.search(s))
+
+
+def check_functional(bom: dict, netlist: dict, symbol_lib=None) -> dict:
+    """检查真正的功能性硬错误，返回结构化结果。"""
+    issues: list[str] = []
+    checked = 0
+    items = bom.get("items", [])
+    nets = netlist.get("nets", [])
+    if not items or not nets:
+        return {"ok": True, "issues": [], "checked": 0}
+
+    by_ref = {it.get("ref", ""): it for it in items}
+    pin_net: dict[tuple[str, str], str] = {}
+    net_pins: dict[str, set[tuple[str, str]]] = {}
+    for net in nets:
+        name = net.get("name", "")
+        members: set[tuple[str, str]] = set()
+        for p in net.get("pins", []):
+            if ":" in p:
+                r, _, n = p.partition(":")
+                members.add((r, n))
+                pin_net[(r, n)] = name
+        net_pins[name] = members
+
+    # 1) 同一引脚出现在两个网络（ERC 会报，但闭环修订后可能引入）
+    seen: dict[tuple[str, str], str] = {}
+    for net in nets:
+        for p in net.get("pins", []):
+            if ":" not in p:
+                continue
+            r, _, n = p.partition(":")
+            key = (r, n)
+            if key in seen and seen[key] != net["name"]:
+                issues.append(f"{p} 同时出现在 {seen[key]} 与 {net['name']}")
+            seen[key] = net["name"]
+
+    # 2) 无源器件（R/C/LED/晶振/电感）每个脚都必须接网——但排除 NC 脚。
+    #    连接器不算：排针/USB 的针脚按设计本就可悬空（如 USB ID、闲置 GPIO）。
+    for it in items:
+        sym = it.get("symbol", "").lower()
+        # 精确前缀，避免 Interface_USB:CH340G / Regulator_Linear 被 ":c"/":l" 误匹配
+        if not sym.startswith(("device:r", "device:c", "device:led",
+                               "device:crystal", "device:l")):
+            continue
+        if symbol_lib:
+            try:
+                pmap = symbol_lib.pin_names(it.get("symbol", ""))
+            except Exception:
+                pmap = {}
+        else:
+            pmap = {}
+        nums = [str(n) for n in pmap.keys()] if pmap else ["1", "2"]
+        for n in nums:
+            nm = str(pmap.get(int(n), pmap.get(n, ""))) if pmap else ""
+            if _is_normal_float_pin(nm):
+                continue
+            if (it["ref"], n) not in pin_net:
+                issues.append(f"{it['ref']}（{it.get('value','')}）的 {n}({nm or '脚'}) 悬空")
+        checked += 1
+
+    # 3) 有源芯片的电源/地脚必须接网（排除 NC 脚与明确标注不接的脚）
+    for it in items:
+        sym = it.get("symbol", "").lower()
+        if not any(k in sym for k in ("mcu_", "regulator", "interface", "rf_module")):
+            continue
+        if symbol_lib:
+            try:
+                names = symbol_lib.pin_names(it.get("symbol", ""))
+            except Exception:
+                names = {}
+        else:
+            names = {}
+        for num, nm in names.items():
+            nm_u = str(nm).upper()
+            if nm_u in ("VCC", "VDD", "GND", "VSS", "VI", "VIN", "VBUS"):
+                if (it["ref"], str(num)) not in pin_net:
+                    issues.append(f"{it['ref']} 的 {nm_u}({num}) 供电脚悬空")
+        checked += 1
+
+    # 4) 稳压器输入/输出不能同网
+    for it in items:
+        if "regulator" not in it.get("symbol", "").lower() or not symbol_lib:
+            continue
+        try:
+            names = symbol_lib.pin_names(it.get("symbol", ""))
+        except Exception:
+            names = {}
+        vi = [str(n) for n, nm in names.items() if str(nm) in ("VI", "VIN")]
+        vo = [str(n) for n, nm in names.items() if str(nm) in ("VO", "VOUT")]
+        if vi and vo:
+            ni = {pin_net.get((it["ref"], p)) for p in vi}
+            no = {pin_net.get((it["ref"], p)) for p in vo}
+            if ni & no and None not in ni | no:
+                issues.append(f"稳压器 {it['ref']} 输入/输出脚同网 {ni & no}，被短接")
+        checked += 1
+
+    # 5) LED 阴阳极不能同网（短路）
+    for it in items:
+        if "led" not in it.get("symbol", "").lower():
+            continue
+        a = _pins(it, symbol_lib, ("A",)).get("A", ["2"])
+        k = _pins(it, symbol_lib, ("K",)).get("K", ["1"])
+        an = pin_net.get((it["ref"], a[0])) if a else None
+        kn = pin_net.get((it["ref"], k[0])) if k else None
+        if an and kn and an == kn:
+            issues.append(f"LED {it['ref']} 阳极/阴极同网 {an}，被短路")
+        checked += 1
+
+    return {"ok": not issues, "issues": issues, "checked": checked}

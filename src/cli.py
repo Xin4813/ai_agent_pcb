@@ -4,7 +4,7 @@ import argparse
 import json
 from pathlib import Path
 
-from .config import load_config, kicad_symbols_dir
+from .config import load_config, find_kicad_symbols_dir
 from .agent import Agent
 from .kicad_writer import write_schematic
 
@@ -29,19 +29,19 @@ def main():
     agent = Agent(cfg=cfg, mock=args.mock)
     bom, netlist, used = agent.design(args.prompt)
 
-    out_dir = Path(args.out) if args.out else (
-        Path(kicad_symbols_dir(cfg)) if False else Path("examples/output")
-    )
+    out_dir = Path(args.out) if args.out else Path("examples/output")
     out_dir.mkdir(parents=True, exist_ok=True)
 
     (out_dir / "bom.json").write_text(json.dumps(bom, ensure_ascii=False, indent=2), encoding="utf-8")
     (out_dir / "netlist.json").write_text(json.dumps(netlist, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    sym_dir = args.symbols_dir
-    if sym_dir is None and cfg:
-        sym_dir = kicad_symbols_dir(cfg)
+    # --symbols-dir 手动指定优先；否则自动探测本机 KiCad 符号库。
+    sym_dir = args.symbols_dir or find_kicad_symbols_dir(cfg)
     if sym_dir is None:
-        sym_dir = "C:/Users/Gray/AppData/Local/Programs/KiCad/8.0/share/kicad/symbols"
+        raise SystemExit(
+            "[错误] 未找到 KiCad 符号库目录。请安装 KiCad 8，或用 --symbols-dir 手动指定，"
+            "或设置环境变量 KICAD_SYMBOL_DIR。"
+        )
 
     sch = write_schematic(netlist, bom, out_dir / "schematic" / f"{_safe_name(bom.get('project','design'))}.kicad_sch", sym_dir)
 

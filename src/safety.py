@@ -74,6 +74,22 @@ def _chip_vcc(item: dict) -> float | None:
     return None
 
 
+def _is_gpio_driver(item: dict) -> bool:
+    """是否可能驱动 GPIO 的主控/SoC——用于 LED 阳极直挂 GPIO 的告警。
+
+    早期只认 "mcu_"/"stm32f1" 符号，漏掉 RF_Module:ESP32-WROOM-32，
+    导致 ESP32 的 LED 直挂 IO 口这类会烧IO的功能错误三检全绿。
+    与 circuit_fix._is_mcu_item 保持同一判据。
+    """
+    if not item:
+        return False
+    sym = item.get("symbol", "").lower()
+    return (_chip_vcc(item) is not None
+            or "mcu_" in sym
+            or "rf_module" in sym
+            or "stm32f1" in sym)
+
+
 def _is_regulator(item: dict) -> bool:
     sym = item.get("symbol", "").lower()
     return "regulator" in sym or "ldo" in sym or "7805" in sym or "1117" in sym
@@ -264,6 +280,16 @@ def check_electrical(bom: dict, netlist: dict, symbol_lib=None) -> list[str]:
                 f"⚠️ LED {ref} 阳极直接接在电源网 {a_net}，没有串联限流电阻——"
                 f"LED 会过流烧毁，请串入 330Ω~1kΩ 电阻（GPIO→电阻→LED→GND）。"
             )
+        # 4b) LED 阳极直接挂在含芯片 GPIO 的网络上，同样没有串联限流。
+        #     电源网那条规则抓不到 GPIO 网，但 GPIO 直驱 LED 一样会烧 IO/LED。
+        elif a_net and not series_res and any(
+                r != ref and (r, _n) in anode_members
+                and _is_gpio_driver(by_ref.get(r, {}))
+                for r, _n in anode_members):
+            _add(
+                f"⚠️ LED {ref} 阳极直接挂在 {a_net} 的芯片 GPIO 上，没有串联限流电阻——"
+                f"通电会烧 LED 或 IO 口，请串入 330Ω~1kΩ（GPIO→电阻→LED→GND）。"
+            )
 
     # 5) USB D+/D− 与 USB 转串口芯片交叉接反
     uart = next((it for it in items if "ch340" in
@@ -272,37 +298,55 @@ def check_electrical(bom: dict, netlist: dict, symbol_lib=None) -> list[str]:
                 "conn_01x05" in it.get("symbol", "").lower()
                 or "usb_micro" in it.get("symbol", "").lower()), None)
     if uart and usb:
-        for dname in ("UD+", "UD-"):
+        for dname, usbname in (("UD+", "D+"), ("UD-", "D-")):
             pins = _pins(uart, symbol_lib, (dname,)).get(dname, [])
-            if not pins:
+            want = _pins(usb, symbol_lib, (usbname,))
+            want_pins = set(next(iter(want.values()), []))
+            if not pins or not want_pins:
                 continue
             n = _net_of(pin_net, uart["ref"], pins[0])
             if not n:
+                _add(
+                    f"⚠️ USB {usbname} 未接到 {uart['ref']} 的 {dname} 脚（{pins[0]}）——"
+                    f"电脑将无法通过 USB 识别串口。"
+                )
                 continue
             usb_side = {num for r, num in net_pins.get(n, set()) if r == usb["ref"]}
-            want = _pins(usb, symbol_lib, ("D+" if dname == "UD+" else "D-",))
-            want_pins = set(next(iter(want.values()), []))
-            if usb_side and want_pins and not (usb_side & want_pins):
+            if not usb_side:
+                _add(
+                    f"⚠️ {uart['ref']} 的 {dname} 网 {n} 上没有 USB 连接器 {usb['ref']} 的引脚——"
+                    f"USB 数据线悬空，电脑将无法识别串口。"
+                )
+            elif not (usb_side & want_pins):
                 wrong = ", ".join(sorted(usb_side))
                 right = ", ".join(sorted(want_pins))
                 _add(
-                    f"⚠️ USB {dname.replace('UD','D')} 接反：{uart['ref']}:{pins[0]} 所在网络 {n} "
+                    f"⚠️ USB {usbname} 接反：{uart['ref']}:{pins[0]} 所在网络 {n} "
                     f"接到 {usb['ref']} 的 {wrong} 脚，实际应为 {right} 脚——"
                     f"USB 通信会失败，请交叉对调。"
                 )
 
-    # 6) CH340G 的 XI/XO 悬空（没有晶振，USB 转串口无法工作）
+    # 6) CH340G 的 XI/XO 之间必须有晶振本体（两个负载电容不算起振）
     if uart:
-        for pname in ("XI", "XO"):
-            pins = _pins(uart, symbol_lib, (pname,)).get(pname, [])
-            if not pins:
-                continue
-            n = _net_of(pin_net, uart["ref"], pins[0])
-            if not n or len(net_pins.get(n, set())) < 2:
-                _add(
-                    f"⚠️ {uart['ref']} 的 {pname} 脚未接晶振——"
-                    f"USB 转串口芯片无法起振，电脑将识别不到串口。"
-                )
+        xi = _pins(uart, symbol_lib, ("XI",)).get("XI", [])
+        xo = _pins(uart, symbol_lib, ("XO",)).get("XO", [])
+        xi_net = _net_of(pin_net, uart["ref"], xi[0]) if xi else None
+        xo_net = _net_of(pin_net, uart["ref"], xo[0]) if xo else None
+        has_xtal = False
+        if xi_net and xo_net and xi_net != xo_net:
+            for it in items:
+                if "crystal" not in it.get("symbol", "").lower():
+                    continue
+                a = _net_of(pin_net, it["ref"], "1")
+                b = _net_of(pin_net, it["ref"], "2")
+                if a and b and {a, b} == {xi_net, xo_net}:
+                    has_xtal = True
+                    break
+        if not has_xtal:
+            _add(
+                f"⚠️ {uart['ref']} 的 XI/XO 之间没有晶振本体（只接负载电容不算）——"
+                f"USB 转串口芯片无法起振，电脑将识别不到串口。"
+            )
 
     # 7) STM32 的 VBAT/VDDA/BOOT0 未接（BOOT0 还需下拉，否则启动模式不确定）
     for it in items:
@@ -320,6 +364,24 @@ def check_electrical(bom: dict, netlist: dict, symbol_lib=None) -> list[str]:
                     f"⚠️ {it['ref']} 的 {pname} 脚（{pins[0]}）未连接{extra}——"
                     f"可能导致芯片不工作或启动模式不确定。"
                 )
+        # NRST 是低有效复位：上拉电阻必须接 3.3V，按键另一端接 GND。
+        # 若电阻改接 GND，复位脚会被永久拉低，芯片一直处于复位态。
+        for rp in _pins(it, symbol_lib, ("NRST",)).get("NRST", []):
+            rn = _net_of(pin_net, it["ref"], rp)
+            if not rn:
+                continue
+            for r, num in net_pins.get(rn, set()):
+                rit = by_ref.get(r, {})
+                if not rit.get("symbol", "").lower().startswith("device:r"):
+                    continue
+                other = "2" if num == "1" else "1"
+                on = pin_net.get((r, other))
+                if on and re.search(r"gnd|vss|ground|地", on, re.I):
+                    _add(
+                        f"⚠️ {it['ref']} 的 NRST 脚（{rp}）上拉电阻 {r} 接到了 GND——"
+                        f"复位脚会被永久拉低，芯片无法运行；该电阻应接 3.3V，"
+                        f"复位按键接 GND。"
+                    )
 
     # 去重
     seen, uniq = set(), []

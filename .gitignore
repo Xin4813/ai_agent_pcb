@@ -12,3 +12,18 @@ __pycache__/
 # 系统/编辑器垃圾
 .DS_Store
 Thumbs.db
+
+# KiCad / Web 运行时与调试临时产物（不入库）
+.svgtmp/
+.dbg*.kicad_pro
+_290f_check.*
+server_run.log
+*.kicad_prl
+examples/output/_tmp_*
+examples/output/schematic/_expand_*
+examples/output/web_sessions/
+
+# 答辩 PPT 生成工具（slidep）中间产物，只保留成品 .pptx 与文案源 STORY.md
+docs/答辩PPT/.cache/
+docs/答辩PPT/.slidep/
+docs/答辩PPT/slides/

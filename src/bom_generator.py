@@ -1,5 +1,6 @@
 """步骤②：自然语言 → BOM 元器件清单。支持 LLM 模式与离线知识库回退。"""
 from __future__ import annotations
+import copy
 import json
 import re
 from .knowledge import lookup_board
@@ -227,10 +228,14 @@ def _check_symbols(bom: dict, symbol_lib) -> list:
 def generate_bom(prompt: str, llm=None, mock: bool = False, max_retries: int = 3,
                  symbol_lib=None):
     board = lookup_board(prompt)
+    # 已知且「钉死」的板卡（当前只有真 8051）即使在真实 LLM 模式下也走内置
+    # 数据：LLM 曾把 8051 画成 ATmega328P，引脚号全错。这里优先保证型号正确。
+    if board is not None and board.get("pinned"):
+        return _expand_bom_refs(copy.deepcopy(board["bom"])), False
     if mock or llm is None:
         if board is None:
             raise RuntimeError("离线模式且未匹配到内置板卡；请提供 LLM 密钥以生成。")
-        return _expand_bom_refs(board["bom"]), False
+        return _expand_bom_refs(copy.deepcopy(board["bom"])), False
 
     # 可用符号目录（本机校验过的真实 lib_id）
     catalog = _build_catalog(symbol_lib)

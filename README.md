@@ -12,9 +12,14 @@
 5. **交互修订**：用自然语言指令（如"把电容换成 100nF"）迭代修改设计。
 
 ## 2. 环境要求
-- Python 3.11+（KiCad 8 配套脚本同样基于现代 Python）
-- KiCad 8（已在 `C:/Users/Gray/AppData/Local/Programs/KiCad/8.0` 安装，本仓库用 8.0.9 验证）
+- Python 3.11+
+- KiCad 8（本仓库用 8.0.9 验证；安装后程序会**自动探测**符号库与 kicad-cli，无需手动配路径）
 - 一个 OpenAI 兼容的 LLM API（可选：不配密钥可用 `--mock` 离线模式跑通全流程）
+
+> **KiCad 路径自动探测**：程序会按「config.toml → 环境变量 → PATH → 各平台默认安装目录」的顺序自动找到 KiCad 8 的符号库和 `kicad-cli`，Windows / macOS / Linux 均适用。如果你的 KiCad 装在非标准位置，只需任选一种方式告诉程序：
+> - 命令行加 `--symbols-dir "你的路径/share/kicad/symbols"`；或
+> - 设置环境变量 `KICAD_SYMBOL_DIR`（符号库目录）和/或 `KICAD_INSTALL_DIR`（安装根目录）；或
+> - 在 `config/config.toml` 的 `[kicad] install_dir` 里填安装根目录（TOML 路径用正斜杠 `/`）。
 
 ## 3. 安装步骤
 ```bash
@@ -23,36 +28,55 @@ cd ai_agent_pcb
 python -m venv venv
 venv\Scripts\activate          # Windows
 pip install -r requirements.txt
-cp config/config.example.toml config/config.toml   # 然后填入你的 API Key（已被 .gitignore 忽略，不会提交）
+```
+
+**只想离线跑通（无需密钥、无需 config.toml）**：直接跳到第 4 节执行 `--mock` 命令即可，最快 1 分钟看到原理图。
+
+**想用真实 LLM**：复制配置模板并填入 API Key（`config.toml` 已被 .gitignore 忽略，不会提交）：
+```bash
+cp config/config.example.toml config/config.toml   # 然后填入你的 API Key
 ```
 
 ## 4. 运行命令
 ```bash
 # 离线模式（无需密钥，用内置 Arduino 最小系统板知识库，推荐先跑通）
-python -m src.cli "帮我设计一块 Arduino 最小系统板" --mock ^
-    --symbols-dir "C:/Users/Gray/AppData/Local/Programs/KiCad/8.0/share/kicad/symbols" ^
-    --out examples/output
+python -m src.cli "帮我设计一块 Arduino 最小系统板" --mock --out examples/output
 
 # 真实 LLM 模式（需先在 config.toml 填好密钥）
-python -m src.cli "帮我设计一块 Arduino 最小系统板" ^
-    --symbols-dir "C:/Users/Gray/AppData/Local/Programs/KiCad/8.0/share/kicad/symbols" ^
-    --out examples/output
+python -m src.cli "帮我设计一块 Arduino 最小系统板" --out examples/output
 
 # 交互修订：生成后输入指令，如 "把电容换成 100nF"，输入 exit 退出
-python -m src.cli "帮我设计一块 Arduino 最小系统板" --mock -i ^
-    --symbols-dir "C:/Users/Gray/AppData/Local/Programs/KiCad/8.0/share/kicad/symbols"
+python -m src.cli "帮我设计一块 Arduino 最小系统板" --mock -i
+```
+> Windows 下若用 PowerShell 换用反引号 `` ` `` 续行（或直接写在一行）；上面命令已是最简形式，直接复制即可运行。KiCad 符号库会自动探测，不需要 `--symbols-dir`。
+
+网页版（可视化交互 + 自动生成 ERC/视觉/安全/功能四检报告）：
+```bash
+python web/server.py            # 然后浏览器打开 http://127.0.0.1:8000
 ```
 
 ## 5. ERC 电气规则校验
 生成原理图后，可用 KiCad 命令行做校验（`src/kicad_writer.py` 已把符号库内嵌进 `.kicad_sch`，因此 `kicad-cli` 能独立解析）：
 ```bash
-kicad-cli sch erc "examples/output/schematic/Arduino_最小系统板__ATmega328P_PU_.kicad_sch" ^
+# 把 <生成的原理图> 换成 examples/output/schematic/ 下实际的 .kicad_sch 文件
+kicad-cli sch erc "examples/output/schematic/<生成的原理图>.kicad_sch" ^
     --output "examples/output/schematic/erc.txt"
 ```
+> 更省事的方式：直接用网页版 `python web/server.py`，每次生成会自动跑 ERC + 视觉 + 安全 + 功能四检，并在结果区显示徽章，无需手敲命令。
+
 > 最小系统板只连接了 VCC/GND/RESET/XTAL1/XTAL2/LED 等必要网络，其余 GPIO 引脚故意留空，因此 ERC 报告里会有若干"引脚未连接"类提示——这属于预期结果，正是"检查闭环"要展示的内容。
 
+ERC 只查电气，查不出"文字压线""导线穿过符号""旗标叠在一起"这类**排版重叠**。这部分由独立的布局自检负责（`src/visual_check.py`），与 ERC 互补：
+```bash
+# 一键扫描所有原理图的排版重叠，有重叠时退出码为 1
+python tests/check_overlaps.py --all
+# 只扫指定文件
+python tests/check_overlaps.py "examples/output/schematic/LM1117稳压电源模块.kicad_sch"
+```
+检测范围：文字互压、导线穿文字/符号本体/PWR_FLAG 菱形、旗标互压、标题栏侵入、导线十字交叉。网页前端每次生成后会自动跑这项检查，在结果区显示"布局"徽章，点开可看详情——排版问题无需再靠人工截图发现。
+
 ## 6. 目录结构
-- `src/`        Agent 全部代码（config / llm_client / knowledge / validator / symbol_lib / bom_generator / netlist_generator / kicad_writer / agent / cli）
+- `src/`        Agent 全部代码（config / llm_client / knowledge / validator / symbol_lib / bom_generator / netlist_generator / kicad_writer / visual_check / agent / cli）
 - `docs/`       设计报告与架构说明（`architecture.md`）
 - `examples/`   生成的 BOM / 网表 / 原理图样例与 ERC 报告
 - `config/`     `config.example.toml`（模板，已提交）与 `config.toml`（真实配置，已忽略）
