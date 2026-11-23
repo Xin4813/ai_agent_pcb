@@ -64,7 +64,7 @@ kicad-cli sch erc "examples/output/schematic/<生成的原理图>.kicad_sch" ^
 ```
 > 更省事的方式：直接用网页版 `python web/server.py`，每次生成会自动跑 ERC + 视觉 + 安全 + 功能四检，并在结果区显示徽章，无需手敲命令。
 
-> 最小系统板只连接了 VCC/GND/RESET/XTAL1/XTAL2/LED 等必要网络，其余 GPIO 引脚故意留空，因此 ERC 报告里会有若干"引脚未连接"类提示——这属于预期结果，正是"检查闭环"要展示的内容。
+> 最小系统板只连接 VCC/GND/RESET/XTAL1/XTAL2/LED 等必要网络，其余 GPIO 故意留空。系统会自动为悬空引脚补 No-Connect 标志、为电源网络补驱动，因此最终 ERC 为 0 违规；把历史基线 63 条收敛到 0，正是"检查闭环"要展示的内容。
 
 ERC 只查电气，查不出"文字压线""导线穿过符号""旗标叠在一起"这类**排版重叠**。这部分由独立的布局自检负责（`src/visual_check.py`），与 ERC 互补：
 ```bash
