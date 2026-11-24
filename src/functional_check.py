@@ -132,6 +132,7 @@ def check_functional(bom: dict, netlist: dict, symbol_lib=None) -> dict:
         checked += 1
 
     # 5) LED 阴阳极不能同网（短路）
+    leds: list[dict] = []
     for it in items:
         if "led" not in it.get("symbol", "").lower():
             continue
@@ -141,6 +142,89 @@ def check_functional(bom: dict, netlist: dict, symbol_lib=None) -> dict:
         kn = pin_net.get((it["ref"], k[0])) if k else None
         if an and kn and an == kn:
             issues.append(f"LED {it['ref']} 阳极/阴极同网 {an}，被短路")
+        leds.append((it, a, k, an, kn))
+        checked += 1
+
+    # 6) LED 回路必须有驱动源：从阳极沿串联电阻 BFS，必须能到达电源网
+    #    （VCC/3V3/5V…）或有源芯片 GPIO 网；若只能走到 GND 或死胡同，
+    #    则整条 LED 支路两端都落在 GND，灯永远不会亮。
+    #    ERC 只看连接规则、视觉只看几何、safety 只看电压极性，四检全绿也
+    #    查不出这种「接了线但不工作」的死回路——这是 functional 独有的盲区。
+    def is_res(ref: str) -> bool:
+        return by_ref.get(ref, {}).get("symbol", "").lower().startswith("device:r")
+
+    def pin_semantic(ref: str, num: str) -> str:
+        """引脚语义名（GND/VSS/PC13/VCC…），无符号库时返回空串。"""
+        if not symbol_lib:
+            return ""
+        it = by_ref.get(ref, {})
+        if not it.get("symbol"):
+            return ""
+        try:
+            names = symbol_lib.pin_names(it["symbol"])
+            return str(names.get(int(num), names.get(num, ""))).upper()
+        except Exception:
+            return ""
+
+    def is_true_gnd(netname: str) -> bool:
+        """真地网：网内成员含器件的 GND/VSS 脚。
+
+        不能只看网名——LLM 常把 GPIO 驱动网命名成 LED2_GND，
+        但其成员 U1:2 其实是 PC13，是真 GPIO，不是地。
+        """
+        for r, num in net_pins.get(netname, ()):
+            sem = pin_semantic(r, num)
+            if sem in ("GND", "VSS", "VSSA", "AGND"):
+                return True
+        # 无符号库时退化为网名判断（兜底）
+        return bool(symbol_lib is None and _GND_RE.search(netname))
+
+    def driven(netname: str) -> bool:
+        """该网是否本身就是驱动源：电源网，或含非无源器件脚(GPIO/连接器/芯片)。
+
+        真地网是电流汇、不是驱动源——GND 网里必然挂着 MCU 的地脚，若把它
+        算作驱动，任何「LED 阳极经电阻回到 GND」的死回路都会被误判为正常。
+        """
+        if is_true_gnd(netname):
+            return False
+        if _SUPPLY_RE.match(netname):
+            return True
+        for r, _n in net_pins.get(netname, ()):
+            sym = by_ref.get(r, {}).get("symbol", "").lower()
+            if sym and not sym.startswith(("device:r", "device:c", "device:l",
+                                           "device:led", "device:crystal")):
+                # 有源器件的脚：若恰好是 GND/VSS 脚则不算，否则是驱动(GPIO/电源脚)
+                if pin_semantic(r, _n) in ("GND", "VSS", "VSSA", "AGND"):
+                    continue
+                return True
+        return False
+
+    for it, a, k, an, kn in leds:
+        if not an or not kn:
+            continue
+        # 沿电阻从阳极出发做 BFS；真地网是汇点，走到它即停止，不再往下传播
+        seen = {an}
+        stack = [an]
+        reached = False
+        while stack:
+            cur = stack.pop()
+            if driven(cur):
+                reached = True
+                break
+            if is_true_gnd(cur):
+                continue
+            for r, num in net_pins.get(cur, ()):
+                if not is_res(r):
+                    continue
+                other = "2" if num == "1" else "1"
+                on = pin_net.get((r, other))
+                if on and on not in seen:
+                    seen.add(on)
+                    stack.append(on)
+        if not reached:
+            issues.append(
+                f"LED {it['ref']} 的阳极({an})经限流电阻只能回到 GND/悬空，"
+                f"走不到电源或 GPIO 驱动源——回路无驱动，灯不会亮")
         checked += 1
 
     return {"ok": not issues, "issues": issues, "checked": checked}

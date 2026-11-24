@@ -891,6 +891,180 @@ def _fix_led(items, ops, lib, fixes):
     _fix_mislabeled_led_resistor(items, ops, lib, fixes)
     _fix_led_gpio_no_resistor(items, ops, lib, fixes)
     _fix_floating_led_gpio(items, ops, lib, fixes)
+    _fix_led_dead_loop(items, ops, lib, fixes)
+
+
+def _fix_led_dead_loop(items, ops, lib, fixes):
+    """修复「LED 阳极经限流电阻只回到 GND、走不到电源」的死回路。
+
+    典型形态（ERC/视觉/safety 全绿、functional 才发现）：
+      LED 阴极 → GND；LED 阳极 → 电阻 → GND。整条支路两端都在地，灯不亮。
+    修复：找主电源网（VCC/VDD/3V3/…，或从稳压器输出推导），把串联电阻
+    接地的那一端迁到电源网，形成 电源→电阻→LED阳极→LED阴极→GND。
+    只复用已有电阻，不新增元件（避免用户抱怨"元件太多"）。判据保守：
+      - 阳极网除 LED 自身外恰好只有一个电阻端；
+      - 该电阻另一端在 GND 网；
+      - 阴极网是 GND 网；
+      - 阳极侧沿电阻 BFS 走不到任何电源/GPIO 驱动源。
+    """
+    by_ref = {it["ref"]: it for it in items}
+    leds = [it for it in items
+            if it.get("symbol", "").lower().endswith(":led")]
+
+    def pin_sem(ref: str, num: str) -> str:
+        if not lib:
+            return ""
+        it = by_ref.get(ref, {})
+        if not it.get("symbol"):
+            return ""
+        try:
+            names = lib.pin_names(it["symbol"])
+            return str(names.get(int(num), names.get(num, ""))).upper()
+        except Exception:
+            return ""
+
+    def has_gnd_pin(netname: str) -> bool:
+        for pin in ops.members(netname):
+            r, _, num = pin.partition(":")
+            if pin_sem(r, num) in ("GND", "VSS", "VSSA", "AGND"):
+                return True
+        return lib is None and bool(_GND_RE.search(netname))
+
+    def is_res(ref):
+        return by_ref.get(ref, {}).get("symbol", "").lower().startswith("device:r")
+
+    # 找主电源网：按引脚语义（芯片 VCC/VDD 脚、稳压器 VO 脚），网名仅兜底。
+    # 不能只靠 _SUPPLY_RE 匹配网名——LLM 会把电源网命名成 PWR_5V 之类，
+    # 换名后网名判据失效（曾导致换名验证里规则整个跳过）。
+    supply = None
+    for net in ops.nets:
+        if has_gnd_pin(net["name"]):
+            continue
+        for pin in ops.members(net["name"]):
+            r, _, num = pin.partition(":")
+            if pin_sem(r, num) in ("VCC", "VDD", "VDDA", "VIN", "VI", "VBUS"):
+                supply = net["name"]
+                break
+        if supply:
+            break
+    if supply is None:
+        for it in items:
+            if "regulator" not in it.get("symbol", "").lower():
+                continue
+            for p in _p(it, lib, "VO") or ["3", "2"]:
+                n = ops.name(f"{it['ref']}:{p}")
+                if n and not has_gnd_pin(n):
+                    supply = n
+                    break
+            if supply:
+                break
+    if supply is None:
+        for net in ops.nets:  # 最后按网名兜底
+            if _SUPPLY_RE.match(net["name"]) and not _GND_RE.search(net["name"]):
+                supply = net["name"]
+                break
+    if supply is None:
+        return
+
+    def is_driven(netname):
+        if has_gnd_pin(netname):
+            return False
+        if _SUPPLY_RE.match(netname):
+            return True
+        for pin in ops.members(netname):
+            r, _, num = pin.partition(":")
+            sym = by_ref.get(r, {}).get("symbol", "").lower()
+            if sym and not sym.startswith(("device:r", "device:c", "device:l",
+                                           "device:led", "device:crystal")):
+                if pin_sem(r, num) in ("GND", "VSS", "VSSA", "AGND"):
+                    continue
+                return True
+        return False
+
+    # 守卫：若某 LED 有对应的「悬空 MCU GPIO 网」，说明它是可由程序控制的
+    # 用户指示灯，应交给 _fix_floating_led_gpio 接 GPIO，而不是接成常亮电源灯。
+    # 否则两条规则会互相把限流电阻在 GPIO/电源间来回搬，永不幂等。
+    gpio_led_ids = set()
+    mcu_refs = {it["ref"] for it in items if _is_mcu_item(it)}
+    for net in ops.nets:
+        pins = list(net["pins"])
+        nl = net["name"].lower()
+        if not pins or "led" not in nl:
+            continue
+        # 网里必须含 MCU 的脚（不限单成员——GPIO 规则改过后网里会有电阻端，
+        # 若只认单成员，改过之后守卫失效，两条规则就会来回搬同一个电阻）。
+        if not any(p.partition(":")[0] in mcu_refs for p in pins):
+            continue
+        m = re.search(r"led\s*(\d+)", nl)
+        if m:
+            gpio_led_ids.add(m.group(1))
+
+    for led in leds:
+        lm = re.search(r"(\d+)$", led["ref"])
+        if lm and lm.group(1) in gpio_led_ids:
+            continue                      # 让位给 GPIO 规则
+        a = next(iter(_p(led, lib, "A")), "2")
+        k = next(iter(_p(led, lib, "K")), "1")
+        a_pin, k_pin = f"{led['ref']}:{a}", f"{led['ref']}:{k}"
+        an, kn = ops.name(a_pin), ops.name(k_pin)
+        if not an or not kn or not has_gnd_pin(kn):
+            continue
+        # 阳极网成员：LED 阳极 + 恰好一个电阻端
+        anode_members = [p for p in ops.members(an) if p != a_pin]
+        res_pins = [p for p in anode_members if is_res(p.partition(":")[0])]
+        if len(res_pins) != 1 or len(anode_members) != 1:
+            continue
+        rp = res_pins[0]
+        rref, _, num = rp.partition(":")
+        other = "2" if num == "1" else "1"
+        other_pin = f"{rref}:{other}"
+        on = ops.name(other_pin)
+
+        # 阳极侧沿电阻 BFS，确认走不到任何驱动源（GND 是汇点，不往下走）
+        seen, stack, reached = {an}, [an], False
+        while stack:
+            cur = stack.pop()
+            if is_driven(cur):
+                reached = True
+                break
+            if has_gnd_pin(cur):
+                continue
+            for p in ops.members(cur):
+                r, n = p.partition(":")[0], p.partition(":")[2]
+                if not is_res(r):
+                    continue
+                op = "2" if n == "1" else "1"
+                nn = ops.name(f"{r}:{op}")
+                if nn and nn not in seen:
+                    seen.add(nn)
+                    stack.append(nn)
+        if reached:
+            continue
+
+        # 情形一：电阻另一端在 GND → 迁到电源（最常见）
+        if on and has_gnd_pin(on):
+            ops.attach(other_pin, supply)
+            fixes.append(
+                f"{led['ref']} 的限流电阻 {rref} 原接 GND 使回路无驱动，"
+                f"改接电源：{supply}→{rref}→{led['ref']}→GND")
+            continue
+
+        # 情形二：电阻另一端落在「另一颗 LED 的阳极网」，而该网同样走不到
+        # 驱动源——LLM 把两颗灯的限流电阻互相跨接（假电源网名如 LED1_VCC，
+        # 但网内无真实电源脚）。把电阻该端迁到电源，两灯共用限流。
+        # 严格判据：另一端网里至少有一颗别的 LED 阳极，且整网无驱动源。
+        if not on or is_driven(on):
+            continue
+        other_led_anode = any(
+            p.partition(":")[0] != led["ref"]
+            and by_ref.get(p.partition(":")[0], {}).get("symbol", "").lower().endswith(":led")
+            for p in ops.members(on))
+        if not other_led_anode:
+            continue
+        ops.attach(other_pin, supply)
+        fixes.append(
+            f"{led['ref']} 的限流电阻 {rref} 原跨接到另一 LED 阳极使回路无驱动，"
+            f"改接电源：{supply}→{rref}→{led['ref']}→GND")
 
 
 def _fix_one_led(led, items, ops, lib, fixes):
