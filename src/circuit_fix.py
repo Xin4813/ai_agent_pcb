@@ -1747,6 +1747,51 @@ def _drop_floating_passives(items, ops, fixes: list[str]) -> None:
             f"另一端悬空；同型号的 {twin['ref']} 已正确接入）")
 
 
+def _reattach_orphan_ground_pins(items, ops, fixes: list[str]) -> None:
+    """修复「无源件的地脚接在只有自己的孤立 GND 网」——如晶振负载电容
+    C1:2 落在 C1_GND、C2:2 落在 C2_GND，实际并未接到真正的 GND 网。
+
+    LLM 常把本该接地的脚写成带 GND 字样的独立网名，造成网表里出现
+    ``C1_GND = ['C1:2']`` 这种单成员网。ERC 不报（脚确实"已连接"），
+    视觉也看不出（有网名有连线），但功能上负载电容没接地、振荡回路不成立，
+    只有功能自检的孤立网检查能发现。
+
+    判据（严格，避免误伤）：
+      - 单成员网，且网名含 GND/VSS/地 语义；
+      - 唯一成员是 Device:C/R/L 等无源件的引脚；
+      - 网表里另有一个"真 GND"网：成员≥2 且含非本件引脚；
+      - 该引脚在符号里确实是地脚（若符号有 GND 引脚名），或网名与位号
+        对应（C1_GND↔C1）——避免把误命名的信号网当地。
+    修法：把该脚改接到真 GND 网，孤立网随之清空。
+    """
+    gnd_nets = [n for n in ops.nets
+                if len(n["pins"]) >= 2 and _GND_RE.search(n["name"])]
+    if not gnd_nets:
+        return
+    # 选成员最多的 GND 网作为"真地"
+    real = max(gnd_nets, key=lambda n: len(n["pins"]))
+
+    for net in list(ops.nets):
+        pins = list(net["pins"])
+        if len(pins) != 1 or net is real or not _GND_RE.search(net["name"]):
+            continue
+        pin = pins[0]
+        ref, _, num = pin.partition(":")
+        item = next((it for it in items if it["ref"] == ref), None)
+        if not item:
+            continue
+        sym = item.get("symbol", "").lower()
+        if not (sym.startswith(("device:c", "device:r", "device:l"))):
+            continue
+        # 网名须与位号对应，防止把 "SOME_GND_LIKE" 这种信号网误判为地
+        if ref.lower().replace("-", "_") not in net["name"].lower().replace("-", "_"):
+            continue
+        real["pins"].append(pin)
+        net["pins"].remove(pin)
+        fixes.append(
+            f"{ref} 的地脚从孤立网 {net['name']} 归位到 {real['name']}")
+
+
 def _drop_dead_end_passives(items, ops, fixes: list[str]) -> None:
     """删除「一端接电源/信号网、另一端完全悬空」的断头无源件（R/C/L）。
 
@@ -1895,6 +1940,7 @@ def fix_topology(bom: dict, netlist: dict, symbol_lib=None) -> list[str]:
     _fix_uart_symbol(items, ops, symbol_lib, fixes)   # 先纠正型号/符号错配，再让 _fix_usb 补晶振
     _fix_usb(items, ops, symbol_lib, fixes)
     ops.drop_empty()
+    _reattach_orphan_ground_pins(items, ops, fixes)  # 孤立地脚先归位，避免被下面当断头件删掉
     _drop_half_wired_leds(items, ops, fixes)
     _drop_dead_end_passives(items, ops, fixes)
     _drop_floating_passives(items, ops, fixes)
