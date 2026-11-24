@@ -199,6 +199,19 @@ def check_functional(bom: dict, netlist: dict, symbol_lib=None) -> dict:
                 return True
         return False
 
+    # 6b) 网表功能覆盖：ERC 看不出、但功能上一定错的漏接。
+    #     - 单脚网络（ICSP 只写排针端、AREF 悬空）
+    #     - 芯片整组 IO 全未接（如 Arduino 的 A0-A5/PC0-PC5 整组丢失），
+    #       而同芯片其它端口已引出。这是「五维全绿却少一路信号」的盲区。
+    #     复用 netlist_generator 的同一套规则，保证生成回灌与交付自检口径一致。
+    try:
+        from .netlist_generator import io_coverage_issues
+        for msg in io_coverage_issues(bom, netlist, symbol_lib):
+            issues.append(msg)
+            checked += 1
+    except Exception:
+        pass
+
     for it, a, k, an, kn in leds:
         if not an or not kn:
             continue

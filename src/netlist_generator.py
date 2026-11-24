@@ -202,6 +202,121 @@ def _complete_interface_nets(nl: dict, board: dict | None) -> dict:
     return nl
 
 
+# 端口组引脚名：PC0/PD5/PB3/PA12 这类「端口字母+序号」。
+# 用于发现「一整组 IO 都没接」这一 ERC/视觉都查不出的功能漏接。
+_PORT_PIN_RE = re.compile(r"^([A-Za-z]{1,2})(\d+)$")
+
+
+def io_coverage_issues(bom: dict, netlist: dict, symbol_lib=None) -> list[str]:
+    """网表功能覆盖自检——专抓 ERC 看不出的「少接一组 IO / 单脚悬空」。
+
+    两条通用规则，不绑定任何具体芯片或项目：
+
+    1. 任一网络只有 1 个引脚 → 必然是一根没连出去的线头（ICSP 只写排针端、
+       AREF 悬空等）。它 ERC 为 0、视觉上有名字有标签，但功能上不成立。
+    2. 有源芯片某端口组（PC0..PC5 等）**全部**未连接，而同芯片其它端口组
+       已经引出 → 几乎必定是生成时漏接了一整组 IO（Arduino 的 A0-A5 就是
+       这种情况）。只在「已有别的组引出」时才报，避免对只用到少量 IO 的
+       芯片误报。
+
+    注意：芯片未使用的 GPIO 单独成网（如 AREF、某个没引出的 PB 脚）
+    属正常设计，不判为错误；只报排针/接口的单脚与整组 IO 漏接。
+
+    返回问题描述列表，供生成阶段回灌 LLM 与 functional_check 共用。
+    """
+    issues: list[str] = []
+    items = bom.get("items", [])
+    nets = netlist.get("nets", [])
+    if not items or not nets:
+        return issues
+
+    by_ref = {it.get("ref", ""): it for it in items}
+
+    def _is_connector(ref: str) -> bool:
+        sym = str(by_ref.get(ref, {}).get("symbol", "")).lower()
+        return sym.startswith(("connector:", "connector_", "terminalblock"))
+
+    def _is_critical_io(ref: str) -> bool:
+        """关键接口排针：ICSP/编程/电源/USB 这类必须逐脚接出的接口。
+
+        普通数字/模拟 IO 扩展排针上偶有未用针脚（如 D11-D13 与 SPI 复用、
+        或单纯没引出）属正常设计，不算错误；只有关键接口的单脚悬空
+        （如 ICSP 的 MISO/MOSI/SCK 只写排针一端）才是功能错误。
+        """
+        it = by_ref.get(ref, {})
+        txt = " ".join(str(it.get(k, "")) for k in ("desc", "name", "value")).lower()
+        return bool(re.search(r"icsp|isp|编程|program|usb|电源|power|调试|swd|jtag", txt))
+
+    # 1) 单脚网络——只报「关键接口单脚」，即 ICSP/电源/USB 的一根信号脚
+    #    没接到芯片，这在功能上一定是错的（一排没连出去的针）。
+    #    芯片自己未使用的 GPIO（如 AREF、某个 PB 脚单独成网）以及普通 IO
+    #    排针上未引出的针脚都属于正常设计，不报——否则会把合法网表误判为
+    #    错误、还逼 LLM 反复臆造连接。
+    for n in nets:
+        pins = n.get("pins", [])
+        if len(pins) != 1:
+            continue
+        ref = pins[0].partition(":")[0]
+        if _is_connector(ref) and _is_critical_io(ref):
+            issues.append(
+                f"网络 {n.get('name')} 只有 {pins[0]} 一个引脚，"
+                f"关键接口（{ref}）引脚未接到芯片或其它器件"
+            )
+
+    if symbol_lib is None:
+        return issues
+
+    connected = {p for n in nets for p in n.get("pins", [])}
+
+    # 2) 芯片整组 IO 漏接
+    for it in items:
+        sym = it.get("symbol", "")
+        sl = sym.lower()
+        if not ("mcu_" in sl or "rf_module" in sl or "soc_" in sl):
+            continue
+        ref = it.get("ref", "")
+        try:
+            names = symbol_lib.pin_names(sym)
+        except Exception:
+            continue
+        groups: dict[str, list[int]] = {}
+        for pin, nm in names.items():
+            m = _PORT_PIN_RE.match(str(nm).strip())
+            if m:
+                groups.setdefault(m.group(1).upper(), []).append(int(pin))
+        if len(groups) < 2:
+            continue
+        wired = {p for pins in groups.values() for p in pins
+                 if f"{ref}:{p}" in connected}
+        if not wired:
+            continue
+        for prefix, pins in sorted(groups.items()):
+            if any(p in wired for p in pins):
+                continue
+            issues.append(
+                f"{ref}（{it.get('value', '')}）的 {prefix} 端口"
+                f"（{len(pins)} 个 IO，引脚 "
+                f"{', '.join(str(p) for p in sorted(pins))}）全部未连接，"
+                f"而同芯片其它 IO 端口已引出——疑似漏接一整组 IO"
+            )
+    return issues
+
+
+def _coverage_feedback(issues: list[str]) -> str:
+    """把覆盖自检结果变成给 LLM 的明确修正指令。"""
+    lines = "\n".join(f"  - {x}" for x in issues)
+    return (
+        "\n\n[网表功能覆盖自检发现问题，请修正后重新输出完整网表 JSON，"
+        "不要只解释]：\n" + lines
+        + "\n修正要求：排针/接口的每根信号脚都必须接到芯片或其它器件，"
+        "绝不允许只有排针一端的单脚网络；"
+        "芯片按端口成组引出的 IO 必须接到 BOM 中对应功能的排针"
+        "（模拟输入 A0-A5/PC0-PC5→模拟IO排针，数字IO→数字IO排针，SPI→编程接口）；"
+        "芯片未使用的 GPIO 可以悬空，不要为了凑数臆造连接；"
+        "不得新增 BOM 之外的位号，也不得臆造符号里不存在的引脚号。"
+    )
+
+
 def generate_netlist(prompt: str, bom: dict, llm=None, mock: bool = False, max_retries: int = 3,
                      symbol_lib=None, feedback: str = ""):
     board = lookup_board(prompt)
@@ -234,8 +349,13 @@ def generate_netlist(prompt: str, bom: dict, llm=None, mock: bool = False, max_r
     base_user += "\n请给出引脚级连接网表。"
 
     last = None
+    cov_feedback = ""     # 上一轮功能覆盖自检发现的问题，回灌给 LLM 修
+    best = None           # 覆盖问题最少的一版，重试耗尽时兜底返回
+    best_count = None
     for _ in range(max_retries):
         user = base_user
+        if cov_feedback:
+            user += cov_feedback
         if last is not None:
             user += f"\n\n[上一次出错，请修正后重试] {last}"
         nl = None
@@ -248,6 +368,15 @@ def generate_netlist(prompt: str, bom: dict, llm=None, mock: bool = False, max_r
             validate_netlist(nl, bom)
             if symbol_lib is not None:
                 _check_pins_exist(nl, bom, symbol_lib)
+            cov = io_coverage_issues(bom, nl, symbol_lib)
+            if cov:
+                # 结构合法但功能有漏接：记住最好的一版，把问题回灌重试，
+                # 而不是让 ERC/视觉全绿、功能却缺一组 IO 的网表直接交付。
+                if best_count is None or len(cov) < best_count:
+                    best, best_count = nl, len(cov)
+                last = None
+                cov_feedback = _coverage_feedback(cov)
+                continue
             return nl, True
         except ValidationError as e:
             # 自纠错回落：校验不通过的网表（无论是因为臆造位号/引脚，还是同一引脚
@@ -261,6 +390,13 @@ def generate_netlist(prompt: str, bom: dict, llm=None, mock: bool = False, max_r
                     validate_netlist(nl, bom)
                     if symbol_lib is not None:
                         _check_pins_exist(nl, bom, symbol_lib)
+                    cov = io_coverage_issues(bom, nl, symbol_lib)
+                    if cov:
+                        if best_count is None or len(cov) < best_count:
+                            best, best_count = nl, len(cov)
+                        last = None
+                        cov_feedback = _coverage_feedback(cov)
+                        continue
                     return nl, True
                 except Exception:
                     last = e
@@ -268,4 +404,8 @@ def generate_netlist(prompt: str, bom: dict, llm=None, mock: bool = False, max_r
             last = e
         except Exception as e:
             last = e
+    if best is not None:
+        # 重试耗尽也不能把整个设计弄崩：返回覆盖问题最少的一版，
+        # 由后续 fix_topology / functional_check 继续兜底并在界面上提示。
+        return best, True
     raise RuntimeError(f"网表生成失败: {last}")
