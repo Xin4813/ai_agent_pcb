@@ -1511,9 +1511,11 @@ def write_schematic(netlist: dict, bom: dict, output_path, symbols_dir,
         for x1, y1, x2, y2, k in wire_segments:
             a = (round(x1, 3), round(y1, 3))
             b = (round(x2, 3), round(y2, 3))
-            if a not in pin_pts and b not in pin_pts:
-                out.append((x1, y1, x2, y2, k))
-                continue
+            # 只要标签锚点严格落在这段导线内部，就该在此劈开——不论端点
+            # 是不是引脚。旧版只劈「一端是引脚」的段，导致「走线端点→走线
+            # 端点」的段中间挂了标签时不被劈，标签外侧那半段成了视觉线头
+            # （整段超过短段裁剪阈值，于是永远留着）。劈开后外侧半段会
+            # 被下面的短段裁剪正确移除，电气不变（标签仍在导线上）。
             horiz = abs(y1 - y2) < EPS
             vert = abs(x1 - x2) < EPS
             if not (horiz or vert):
@@ -1552,8 +1554,11 @@ def write_schematic(netlist: dict, bom: dict, output_path, symbols_dir,
         drop = []
         for seg in wire_segments:
             x1, y1, x2, y2, _k = seg
-            if abs(x1 - x2) + abs(y1 - y2) > 3 * GRID + 1e-6:
-                continue
+            # 旧版只裁 ≤3 格的短线头，导致「标签锚点被 stub_trim 挪走后
+            # 残留的长 stub」（末端 deg=1、既非引脚也非标签也非接点）因
+            # 太长而永远保留，成为截图里的悬空线头。悬空端点本身就是
+            # 作废的充分条件：合法 stub 的末端必落在引脚/标签/接点上。
+            # 去掉长度限制，但要求该段至少一端 deg=1 且完全悬空。
             for p in ((round(x1, 3), round(y1, 3)), (round(x2, 3), round(y2, 3))):
                 if deg[p] == 1 and p not in valid:
                     drop.append(seg)

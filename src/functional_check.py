@@ -140,6 +140,30 @@ def _check_connector_function(items: list, by_ref: dict, pin_net: dict,
             if len(members) <= 1:
                 issues.append(f"{n}（{label}）只挂在 {sorted(members)} 一个脚上、"
                               f"未引出到调试排针——调试器无法连接")
+    # 2b) 更隐蔽：网名都没生成，MCU 的 SWD 脚完全不在网表里。
+    #     按符号引脚名语义定位；已接出（pin_net 有值）的不报。
+    if symbol_lib:
+        for it in items:
+            if "mcu" not in str(it.get("symbol", "")).lower() and \
+               not re.search(r"stm32|atmega|esp32|mcu", str(it.get("value", "")), re.I):
+                continue
+            try:
+                names = (symbol_lib.pin_names_with_alts(it.get("symbol", ""))
+                         if hasattr(symbol_lib, "pin_names_with_alts")
+                         else symbol_lib.pin_names(it.get("symbol", "")))
+            except Exception:
+                continue
+            ref = it.get("ref", "")
+            for pat, label in ((r"swdio|swdat|jtms", "SWDIO"),
+                               (r"swclk|swck|jtc", "SWCLK")):
+                for num, nm in names.items():
+                    if not re.search(pat, str(nm), re.I):
+                        continue
+                    checked += 1
+                    if (ref, str(num)) not in pin_net:
+                        issues.append(f"MCU {ref} 的调试脚 {num}({nm}，{label}) "
+                                      f"完全悬空、未引出 SWD 排针——程序无法烧录/调试")
+                    break
     return issues, checked
 
 

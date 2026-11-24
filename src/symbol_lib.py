@@ -303,6 +303,35 @@ class SymbolLib:
                 names[n] = name
         return names
 
+    def pin_names_with_alts(self, lib_id: str) -> dict:
+        """返回 {引脚号(int): 该脚所有名字(含 alternate)合并的大写字符串}。
+
+        KiCad 符号里一个物理脚可有多个 alternate 名，例如 STM32 的 PA13
+        主名是 PA13、alternate 是 SYS_JTMS-SWDIO。`pin_names()` 只给主名，
+        无法据此识别 SWDIO/SWCLK 等功能脚。本方法把主名与所有 alternate
+        名拼到一起，供按功能语义识别引脚用。
+        """
+        out: dict[int, str] = {}
+        for node in self._resolve_chain(lib_id):
+            for pin_node in _collect_pins(node):
+                num = _find_sub(pin_node, "number")
+                if num is None:
+                    continue
+                try:
+                    n = int(num[1].strip('"'))
+                except (ValueError, IndexError):
+                    continue
+                bits = []
+                nm = _find_sub(pin_node, "name")
+                if nm and len(nm) > 1:
+                    bits.append(nm[1].strip('"'))
+                for alt in pin_node:
+                    if isinstance(alt, list) and alt and alt[0] == "alternate" and len(alt) > 1:
+                        bits.append(str(alt[1]).strip('"'))
+                text = " ".join(bits).upper()
+                out[n] = (out.get(n, "") + " " + text).strip()
+        return out
+
     def get_symbol_definitions(self, lib_id: str, qualified: bool = False) -> list:
         """返回该符号用于内嵌到 .kicad_sch 的 (lib_symbols ...) 的 S-expression 文本。
 

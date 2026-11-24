@@ -2342,6 +2342,40 @@ def _fix_swd_breakout(items, ops, lib, fixes: list[str]) -> None:
     swclk = next((n for n in ops.nets
                   if re.search(r"swclk|swck|jtc", n["name"], re.I)
                   and len(n["pins"]) == 1), None)
+
+    # 更隐蔽的一种：LLM 连网名都没生成，SWD 脚完全不在网表里（被写成
+    # no_connect）。此时网名语义规则找不到任何东西，但芯片照样烧不进程序。
+    # 按符号真实引脚名（SWDIO/SWDAT/JTMS、SWCLK/SWCK/JTCK）定位 MCU 脚，
+    # 若该脚悬空则新建网名，交给下面统一加排针。
+    def _mcu_swd_pin(kind: str) -> str | None:
+        pat = re.compile(r"swdio|swdat|jtms" if kind == "io" else r"swclk|swck|jtc", re.I)
+        for it in items:
+            if not _is_mcu_item(it):
+                continue
+            try:
+                names = (lib.pin_names_with_alts(it["symbol"])
+                         if hasattr(lib, "pin_names_with_alts")
+                         else lib.pin_names(it["symbol"]))
+            except Exception:
+                continue
+            for num, nm in names.items():
+                if pat.search(str(nm)):
+                    pin = f"{it['ref']}:{num}"
+                    if not ops.name(pin):          # 完全悬空才处理
+                        return pin
+        return None
+
+    if not swdio or not swclk:
+        io_pin = _mcu_swd_pin("io") if not swdio else None
+        clk_pin = _mcu_swd_pin("clk") if not swclk else None
+        if io_pin:
+            nn = f"{io_pin.replace(':', '_')}_SWDIO"
+            swdio = ops.ensure(nn)
+            swdio["pins"].append(io_pin)
+        if clk_pin:
+            nn = f"{clk_pin.replace(':', '_')}_SWCLK"
+            swclk = ops.ensure(nn)
+            swclk["pins"].append(clk_pin)
     if not swdio or not swclk:
         return
     sym_id = "Connector:Conn_01x04_Pin"
