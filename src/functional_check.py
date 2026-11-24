@@ -90,6 +90,59 @@ def _is_normal_float_pin(pin_name: str) -> bool:
     return bool(_NORMAL_FLOAT.search(s))
 
 
+def _check_connector_function(items: list, by_ref: dict, pin_net: dict,
+                              net_pins: dict, symbol_lib=None) -> tuple[list[str], int]:
+    """连接器层面的两类硬错误（ERC / 视觉 / 安全都查不出）：
+
+    1) USB 连接器接了 D± 却漏接 GND 脚——USB 无回流地，转串口完全不可用；
+    2) 网名含 SWDIO/SWCLK 却只挂 MCU 一个脚、没有引到任何排针——调试器无处接。
+    判据只看网名语义 / 引脚语义与连接关系，不绑定位号。
+    """
+    issues: list[str] = []
+    checked = 0
+    # 1) USB 口 GND
+    for it in items:
+        sym = str(it.get("symbol", "")).lower()
+        if not ("conn_01x05" in sym or "usb_micro" in sym or "usb_type" in sym):
+            continue
+        ref = it.get("ref", "")
+        names = [pin_net.get((ref, str(n)), "") for n in range(1, 6)]
+        if not any(re.search(r"usb_d[+-]|(^|_)d[+-]$", n, re.I) for n in names):
+            continue
+        checked += 1
+        # GND 引脚号：优先符号引脚名，回退 Micro-B 的 5 脚
+        gnd_pin = None
+        if symbol_lib:
+            try:
+                for num, nm in symbol_lib.pin_names(it.get("symbol", "")).items():
+                    if re.search(r"gnd|ground|vss", str(nm), re.I):
+                        gnd_pin = str(num)
+                        break
+            except Exception:
+                pass
+        if gnd_pin is None:
+            gnd_pin = "5"
+        gnd_net = pin_net.get((ref, gnd_pin))
+        if gnd_net is None:
+            issues.append(f"USB 连接器 {ref} 的 GND 脚 {gnd_pin} 悬空——"
+                          f"USB 无回流地，转串口/供电回路不成立")
+        elif not _GND_RE.search(gnd_net):
+            issues.append(f"USB 连接器 {ref} 的 GND 脚 {gnd_pin} 接在 {gnd_net} 而非 GND")
+    # 2) SWD 信号未引出
+    swd_nets = {
+        "SWDIO": [n for n in net_pins if re.search(r"swdio|swdat|jtms", n, re.I)],
+        "SWCLK": [n for n in net_pins if re.search(r"swclk|swck|jtc", n, re.I)],
+    }
+    for label, nets in swd_nets.items():
+        for n in nets:
+            members = net_pins.get(n, set())
+            checked += 1
+            if len(members) <= 1:
+                issues.append(f"{n}（{label}）只挂在 {sorted(members)} 一个脚上、"
+                              f"未引出到调试排针——调试器无法连接")
+    return issues, checked
+
+
 def check_functional(bom: dict, netlist: dict, symbol_lib=None) -> dict:
     """检查真正的功能性硬错误，返回结构化结果。"""
     issues: list[str] = []
@@ -277,6 +330,15 @@ def check_functional(bom: dict, netlist: dict, symbol_lib=None) -> dict:
         for msg in io_coverage_issues(bom, netlist, symbol_lib):
             issues.append(msg)
             checked += 1
+    except Exception:
+        pass
+
+    # 6c) 连接器功能硬错误：USB 口漏 GND、SWD 信号未引出排针
+    try:
+        ci, cc = _check_connector_function(items, by_ref, pin_net, net_pins, symbol_lib)
+        for msg in ci:
+            issues.append(msg)
+            checked += cc
     except Exception:
         pass
 

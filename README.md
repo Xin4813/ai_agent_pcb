@@ -57,6 +57,8 @@ python web/server.py            # 然后浏览器打开 http://127.0.0.1:8000
 
 > **修改代码或知识库模板后必须重启网页服务**：`web/server.py` 是常驻进程，Python 模块与内置模板在启动时一次性载入内存；之后只改文件、提交或 push，运行中的网站仍会用旧逻辑/旧模板生成原理图。重启后再用 `python tests/audit_full.py` 做一次五维回归，确认 ERC / 布局 / 安全 / 功能 / 拓扑修复均为 0。
 
+> **ERC=0 ≠ 功能正确，接口要按完整连接集合核对**：曾出现 ERC/视觉/安全/功能五维全绿、但 USB 口漏接 GND（无回流地）、SWD 调试信号只挂 MCU 单脚（调试器接不上）却漏检的情况。现在功能自检会按接口标准核对：接了 USB D± 的连接器必须有 GND 脚、网名含 SWDIO/SWCLK 的信号必须引到排针；生成器也会自动补 USB 地、自动加 SWD 排针并改正「标 SWD 却接 USB」的错配标注。交付前仍建议用 `kicad-cli sch export netlist` 导出权威网表逐脚核对一遍。
+
 ## 5. ERC 电气规则校验
 生成原理图后，可用 KiCad 命令行做校验（`src/kicad_writer.py` 已把符号库内嵌进 `.kicad_sch`，因此 `kicad-cli` 能独立解析）：
 ```bash

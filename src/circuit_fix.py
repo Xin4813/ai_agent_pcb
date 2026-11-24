@@ -2108,6 +2108,92 @@ def _break_out_missing_io_ports(items, ops, lib, fixes: list[str]) -> None:
                 f"新增 {jref}（{count}Pin）并逐脚连接到 {prefix}0…{prefix}{entries[-1][0]}")
 
 
+def _fix_usb_connector_ground(items, ops, lib, fixes: list[str]) -> None:
+    """接了 USB D± 的连接器，GND 脚必须真的接到 GND 网。
+
+    LLM 常把 Micro-B 画成 VBUS/D−/D+ 三脚，5 脚(GND)留空；ERC 不报
+    （连接器针脚悬空合法）、视觉不报，但 USB 没有回流地，转串口完全不可用。
+    仅在 GND 脚**悬空**时补接；已接到别的网则不动，避免破坏有意设计。
+    """
+    gnd = _gnd_net(ops)
+    for it in items:
+        sym = str(it.get("symbol", "")).lower()
+        if not ("conn_01x05" in sym or "usb_micro" in sym or "usb_type" in sym):
+            continue
+        ref = it["ref"]
+        netnames = [n["name"] for n in ops.nets
+                    if any(p.startswith(ref + ":") for p in n["pins"])]
+        if not any(re.search(r"usb_d[+-]|(^|_)d[+-]$", n, re.I) for n in netnames):
+            continue
+        d_p, d_m = _usb_data_pins(it, lib)
+        gnd_pin = None
+        if lib:
+            try:
+                for num, nm in lib.pin_names(it["symbol"]).items():
+                    if re.search(r"gnd|ground|vss", str(nm), re.I):
+                        gnd_pin = str(num)
+                        break
+            except Exception:
+                pass
+        if gnd_pin is None and d_p == "3" and d_m == "2":
+            gnd_pin = "5"          # Micro-B / Type-A：1=VBUS 2=D− 3=D+ 4=ID 5=GND
+        if gnd_pin is None:
+            continue
+        pin = f"{ref}:{gnd_pin}"
+        if ops.name(pin):          # 已接任何网就不动，只补真正悬空的
+            continue
+        ops.attach(pin, gnd)
+        fixes.append(f"USB 连接器 {ref} 的 GND 脚 {gnd_pin} 原悬空，已接 {gnd}"
+                     f"（否则 USB 无回流地，转串口不可用）")
+        # 标注错配：写着「SWD/调试」的口却接成 USB D±，会把 BOM/贴装带偏。
+        ident = f"{it.get('name', '')} {it.get('desc', '')}"
+        if re.search(r"swd|jtag|调试", ident, re.I):
+            it["name"] = "USB 接口（Micro-B）"
+            it["value"] = "USB-Micro-B"
+            it["desc"] = "USB 5V/D+/D− 输入"
+            fixes.append(f"连接器 {ref} 标注为「SWD 调试口」却实际接 USB D±，"
+                         f"已更正为 USB 连接器标注")
+
+
+def _fix_swd_breakout(items, ops, lib, fixes: list[str]) -> None:
+    """网名含 SWDIO/SWCLK 却只挂 MCU 单脚时，新增 4 针 SWD 排针逐脚引出。
+
+    LLM 常生成 PA13_SWDIO / PA14_SWCLK 这类网名，却只把它们接在 MCU 一个
+    脚上，调试器没有可插的排针，下载/调试完全不可用。ERC 不报（悬空输入
+    合法）、视觉不报，属功能盲区。判据只看网名语义 + 单成员，不绑定位号；
+    已引出到任意连接器的不再重复添加。
+    """
+    if not lib or not any(_is_mcu_item(it) for it in items):
+        return
+    swdio = next((n for n in ops.nets
+                  if re.search(r"swdio|swdat|jtms", n["name"], re.I)
+                  and len(n["pins"]) == 1), None)
+    swclk = next((n for n in ops.nets
+                  if re.search(r"swclk|swck|jtc", n["name"], re.I)
+                  and len(n["pins"]) == 1), None)
+    if not swdio or not swclk:
+        return
+    sym_id = "Connector:Conn_01x04_Pin"
+    try:
+        lib.pin_numbers(sym_id)
+    except Exception:
+        return
+    jref = _add_ref(items, "J")
+    items.append({
+        "ref": jref, "name": "SWD 调试接口", "value": "4Pin", "qty": 1,
+        "symbol": sym_id, "footprint": "",
+        "desc": "引出 SWDIO/SWCLK/GND/Vref",
+    })
+    vref = _v33_net(ops, items, lib) or ""
+    ops.attach(f"{jref}:1", swdio["name"])
+    ops.attach(f"{jref}:2", swclk["name"])
+    ops.attach(f"{jref}:3", _gnd_net(ops))
+    if vref:
+        ops.attach(f"{jref}:4", vref)
+    fixes.append(f"新增 SWD 调试排针 {jref}：SWDIO/SWCLK/GND/Vref 逐脚引出"
+                 f"（原 {swdio['name']}/{swclk['name']} 只挂 MCU 单脚，调试器接不上）")
+
+
 def fix_topology(bom: dict, netlist: dict, symbol_lib=None) -> list[str]:
     """就地修正可检测到的拓扑错误，返回修正说明列表。"""
     items = bom.get("items", [])
@@ -2125,6 +2211,8 @@ def fix_topology(bom: dict, netlist: dict, symbol_lib=None) -> list[str]:
     _fix_uart_symbol(items, ops, symbol_lib, fixes)   # 先纠正型号/符号错配，再让 _fix_usb 补晶振
     _split_shared_crystal(items, ops, symbol_lib, fixes)  # 两芯片共用晶振→拆分，MCU 改用悬空的那颗
     _fix_usb(items, ops, symbol_lib, fixes)
+    _fix_usb_connector_ground(items, ops, symbol_lib, fixes)  # USB 口 GND 悬空 → 补地
+    _fix_swd_breakout(items, ops, symbol_lib, fixes)  # SWD 信号只挂单脚 → 加排针引出
     _break_out_missing_io_ports(items, ops, symbol_lib, fixes)  # 整组 IO 漏接 → 加排针逐脚引出
     ops.drop_empty()
     _reattach_orphan_ground_pins(items, ops, fixes, symbol_lib)  # 孤立地脚先归位，避免被下面当断头件删掉
