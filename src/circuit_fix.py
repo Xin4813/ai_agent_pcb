@@ -934,11 +934,15 @@ def _fix_one_led(led, items, ops, lib, fixes):
                     and other_members == {f"{it['ref']}:{other}"}):
                 candidate, candidate_kind = (it, other), "gpio"
                 break
-            # B) 跨在电源与 GND 之间的电阻（误接的限流电阻）
-            # 注意：电源/GND 是公共网，此处不能要求「另一端只有它自己」，
-            # 只看电阻两端分别落在电源网和 GND 网即可。
+            # B) 电源端的电阻，另一端是 GND 或完全悬空，均复用为限流电阻：
+            #    B1) 跨在电源与 GND 之间——LLM 把限流电阻误接成「跨电源直连」；
+            #    B2) 一端接电源、另一端完全悬空——LLM 标成「限流电阻」却只接了
+            #        一端的断头件（此前不匹配任何候选，导致兜底新增 R3、R2 悬空）。
+            #    两类都改成 电源→R→LED→GND，避免新增冗余电阻、也不留断头件。
+            # 注意：电源/GND 是公共网，此处不能要求「另一端只有它自己」。
+            floating = on is None or other_members == {f"{it['ref']}:{other}"}
             if (n and _SUPPLY_RE.match(n)
-                    and on and _GND_RE.search(on)):
+                    and ((on and _GND_RE.search(on)) or floating)):
                 candidate, candidate_kind = (it, num), "supply"
                 break
         if candidate:
@@ -958,7 +962,7 @@ def _fix_one_led(led, items, ops, lib, fixes):
         ops.attach(a_pin, led_net)
         ops.attach(f"{res['ref']}:{gnd_side}", led_net)
         ops.attach(k_pin, "GND")
-        fixes.append(f"{res['ref']} 由跨接电源改为串联限流：电源→{res['ref']}→{led['ref']}→GND")
+        fixes.append(f"复用 {res['ref']} 作 {led['ref']} 的限流电阻：电源→{res['ref']}→{led['ref']}→GND")
     else:
         # 兜底：新建电阻，接到一个空闲 GPIO 网（电源→电阻→LED→GND 会使 LED 常亮，
         # 但至少不会过流；优先找一个 MCU 空闲脚驱动）
@@ -1569,6 +1573,39 @@ def _drop_floating_passives(items, ops, fixes: list[str]) -> None:
             f"另一端悬空；同型号的 {twin['ref']} 已正确接入）")
 
 
+def _drop_dead_end_passives(items, ops, fixes: list[str]) -> None:
+    """删除「一端接电源/信号网、另一端完全悬空」的断头无源件（R/C/L）。
+
+    LLM 常生成只接了一端的限流电阻/滤波电容（如 R2 只接 VCC、另一端悬空），
+    或修复流程复用/新增了新电阻后，旧的断头电阻残留在网表里。这类件不构成
+    任何回路、永远不起作用，ERC/视觉都不报，功能自检会报悬空，BOM 还让用户
+    多买料。判据严格（避免误删设计上故意单端的件）：
+      - 仅 Device:C/R/L，且恰好一端接网、另一端完全不接网；
+      - 悬空端不属于任何网（不是「接了个只有自己的网」这种 Tuning 场景）；
+      - 元件未被其它修正规则在本轮复用（复用后两端都有网，自然不满足）。
+    """
+    used = {p: n["name"] for n in ops.nets for p in n["pins"]}
+    for it in list(items):
+        sym = it.get("symbol", "").lower()
+        if not (sym.startswith("device:c") or sym.startswith("device:r")
+                or sym.startswith("device:l")):
+            continue
+        ref = it["ref"]
+        p1, p2 = f"{ref}:1", f"{ref}:2"
+        n1, n2 = used.get(p1), used.get(p2)
+        if bool(n1) == bool(n2):       # 必须恰好一端接网
+            continue
+        attached, net_name = (p1, n1) if n1 else (p2, n2)
+        # 接网端必须是电源或信号网（不能是 GND，那由 _drop_floating_passives 处理）
+        if _GND_RE.search(net_name or ""):
+            continue
+        ops.remove_component(ref, [p1, p2])
+        items[:] = [x for x in items if x is not it]
+        fixes.append(
+            f"删除断头无源件 {ref}（{it.get('value','')}，仅 {attached.split(':')[1]} "
+            f"脚接 {net_name}、另一脚悬空，不构成回路）")
+
+
 def _drop_half_wired_leds(items, ops, fixes: list[str]) -> None:
     """删除「阴极接 GND、阳极完全悬空」的残缺 LED。
 
@@ -1669,6 +1706,7 @@ def fix_topology(bom: dict, netlist: dict, symbol_lib=None) -> list[str]:
     _fix_usb(items, ops, symbol_lib, fixes)
     ops.drop_empty()
     _drop_half_wired_leds(items, ops, fixes)
+    _drop_dead_end_passives(items, ops, fixes)
     _drop_floating_passives(items, ops, fixes)
     _drop_duplicate_ghost_items(items, ops, fixes)
     _drop_stale_migration_fixes(ops, fixes)
