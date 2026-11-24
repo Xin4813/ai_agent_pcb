@@ -160,8 +160,6 @@ def _render_and_package(ctx: dict, autofix: bool, max_fix: int = 2) -> dict:
     bom, netlist, cli = agent.state["bom"], agent.state["netlist"], ctx["cli"]
     out_dir, sym_dir, name = ctx["out_dir"], ctx["sym_dir"], ctx["name"]
 
-    (out_dir / "bom.json").write_text(json.dumps(bom, ensure_ascii=False, indent=2), encoding="utf-8")
-
     sch = write_schematic(netlist, bom, out_dir / "schematic" / f"{name}.kicad_sch", sym_dir)
 
     loop = []
@@ -205,6 +203,13 @@ def _render_and_package(ctx: dict, autofix: bool, max_fix: int = 2) -> dict:
         agent.state["topology_fixes"] = fixes
     agent.state["netlist"] = netlist
     agent._refresh_warnings()
+    # 必须在拓扑修复「之后」落盘：修复会往 BOM 新增限流/负载等元件
+    # （如 LED 的 1kΩ R2）。若在修复前写 bom.json，磁盘清单就缺这些件，
+    # 而原理图/网表却有——按 BOM 采购会漏料，审计也会因引用不一致报错。
+    # 这里再校验一次，保证落盘的 BOM 与网表严格自洽。
+    from src.validator import validate_netlist
+    validate_netlist(netlist, bom)
+    (out_dir / "bom.json").write_text(json.dumps(bom, ensure_ascii=False, indent=2), encoding="utf-8")
     (out_dir / "netlist.json").write_text(json.dumps(netlist, ensure_ascii=False, indent=2), encoding="utf-8")
     # 拓扑变了必须重画原理图，否则 SVG/ERC 还是修正前的连线。
     sch = write_schematic(netlist, bom, sch, sym_dir)
