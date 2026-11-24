@@ -1104,17 +1104,21 @@ def write_schematic(netlist: dict, bom: dict, output_path, symbols_dir,
             endpoint_cells.add(_to_grid(_e[2], _e[3]))
         if _job["flag"]:
             endpoint_cells.add(_to_grid(_job["flag"][0], _job["flag"][1]))
-    # 菱形本体在引脚点上方 2 格；登记为硬障碍，但真实端点格必须可达。
+    # 菱形本体在引脚点上方 2 格、左右各 1 格（与 visual_check.flag_bbox
+    # 同一几何）；全部登记为硬障碍，但真实端点格必须可达。
+    # 过去只挡住脚点正上方一列，异网/本网导线可以沿菱形腰部横线擦过本体
+    # （y = gj-1 那一行）再拐进脚点，视觉自检就会报“导线穿旗标”。
     flag_body_cells = set()
     for _job in net_jobs:
         if not _job["flag"]:
             continue
         _gi, _gj = _to_grid(_job["flag"][0], _job["flag"][1])
-        for _dj in (0, 1, 2):
-            _c = (_gi, _gj - _dj)
-            if _c not in endpoint_cells:
-                flag_body_cells.add(_c)
-                blocked.add(_c)
+        for _di in (-1, 0, 1):
+            for _dj in (1, 2):
+                _c = (_gi + _di, _gj - _dj)
+                if _c not in endpoint_cells:
+                    flag_body_cells.add(_c)
+                    blocked.add(_c)
 
     # ⑤ 通用标签避让：同一网络只挂一个标签，其余端点靠导线连接。
     #    标签锚点默认在 stub 末端；若与别的标签 / 元件文字 / 旗标 / 符号本体
