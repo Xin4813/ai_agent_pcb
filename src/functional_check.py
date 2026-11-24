@@ -320,6 +320,27 @@ def check_functional(bom: dict, netlist: dict, symbol_lib=None) -> dict:
                 return True
         return False
 
+    # 6a) 「用户指示灯」必须受 GPIO 控制，不能经限流电阻常亮在电源。
+    #     常亮在 VCC 时 BFS 会误判为「有驱动源」，需单独查阳极串联电阻的
+    #     另一端是否落在纯电源网；只针对 BOM 明确写「用户指示灯」的器件，
+    #     不误伤真正的电源指示灯。
+    for it, a, k, an, kn in leds:
+        desc = f"{it.get('name','')} {it.get('desc','')}".lower()
+        if "用户" not in desc and "user" not in desc:
+            continue
+        if not an:
+            continue
+        for r, num in net_pins.get(an, ()):
+            if not is_res(r):
+                continue
+            other = "2" if num == "1" else "1"
+            on = pin_net.get((r, other))
+            if on and (_SUPPLY_RE.match(on) or _GND_RE.search(on)):
+                issues.append(
+                    f"用户指示灯 {it['ref']} 经 {r} 常亮在 {on}——不受 MCU 控制，"
+                    f"应把 {r} 该端接到对应 GPIO")
+                checked += 1
+
     # 6b) 网表功能覆盖：ERC 看不出、但功能上一定错的漏接。
     #     - 单脚网络（ICSP 只写排针端、AREF 悬空）
     #     - 芯片整组 IO 全未接（如 Arduino 的 A0-A5/PC0-PC5 整组丢失），
@@ -369,5 +390,74 @@ def check_functional(bom: dict, netlist: dict, symbol_lib=None) -> dict:
                 f"LED {it['ref']} 的阳极({an})经限流电阻只能回到 GND/悬空，"
                 f"走不到电源或 GPIO 驱动源——回路无驱动，灯不会亮")
         checked += 1
+
+    # 6d) 晶振负载电容：主晶振两脚网若无 pF 电容到真 GND，8MHz 起不来。
+    #     公共端浮空网（OSC_CAP=[C5:2,C6:2] 无 GND 成员）同样报出。
+    try:
+        from .circuit_fix import _gnd_net, _has_load_cap, _Nets
+        _ops = _Nets(netlist)
+        _gnd = _gnd_net(_ops)
+        if _gnd:
+            for xt in items:
+                if "crystal" not in str(xt.get("symbol", "")).lower():
+                    continue
+                for p in ("1", "2"):
+                    xn = pin_net.get((xt["ref"], p))
+                    if xn and not _has_load_cap(_ops, items, xn, _gnd):
+                        issues.append(
+                            f"晶振 {xt['ref']} 的 {p} 脚网 {xn} 无 pF 负载电容接 GND——"
+                            f"振荡回路不完整，芯片可能不起振")
+                        checked += 1
+            # 浮空公共端：只有 pF 电容脚、无 GND/电源成员的网
+            for name, members in net_pins.items():
+                if len(members) < 2 or _GND_RE.search(name) or _SUPPLY_RE.match(name):
+                    continue
+                refs = {r for r, _ in members}
+                its = [by_ref.get(r, {}) for r in refs]
+                if all("c" in str(i.get("symbol", "")).lower().split(":")[-1]
+                       and "pf" in str(i.get("value", "")).lower() for i in its):
+                    issues.append(
+                        f"网 {name} 只含 {len(members)} 个 pF 电容脚、无真正接地——"
+                        f"负载电容浮空，晶振回路不成立")
+                    checked += 1
+    except Exception:
+        pass
+
+    # 6e) 串口 TX/RX 直连：UART 的 TXD 接 MCU 的 TX、RXD 接 RX，收发都不通。
+    try:
+        from .circuit_fix import _looks_uart_symbol, _is_mcu_item, _p, _mcu_uart_role
+        for uart in items:
+            if not _looks_uart_symbol(uart, symbol_lib):
+                continue
+            tx = _p(uart, symbol_lib, "TXD") or _p(uart, symbol_lib, "TX")
+            rx = _p(uart, symbol_lib, "RXD") or _p(uart, symbol_lib, "RX")
+            if not tx or not rx:
+                continue
+            tn = pin_net.get((uart["ref"], next(iter(tx))))
+            rn = pin_net.get((uart["ref"], next(iter(rx))))
+            if not tn or not rn or tn == rn:
+                continue
+            def _role(n):
+                for r, num in net_pins.get(n, ()):
+                    mcu = by_ref.get(r)
+                    if not mcu or not _is_mcu_item(mcu):
+                        continue
+                    nm = ""
+                    if symbol_lib:
+                        try:
+                            nm = str(symbol_lib.pin_names(mcu["symbol"]).get(int(num), ""))
+                        except (ValueError, TypeError):
+                            pass
+                    role = _mcu_uart_role(nm, n)
+                    if role:
+                        return role
+                return None
+            if _role(tn) == "TX" and _role(rn) == "RX":
+                issues.append(
+                    f"{uart['ref']} 的 TXD 接 MCU 发送网 {tn}、RXD 接接收网 {rn}"
+                    f"（收发直连）——串口对调后才能通信")
+                checked += 1
+    except Exception:
+        pass
 
     return {"ok": not issues, "issues": issues, "checked": checked}

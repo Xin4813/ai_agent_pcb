@@ -786,8 +786,12 @@ def _fix_floating_led_gpio(items, ops, lib, fixes):
         if not mcu:
             continue
         net_l = net["name"].lower()
-        if "led" not in net_l:
-            continue                      # 只处理含 LED 语义的悬空网
+        # 网名含 LED 语义（LED2_GND）或本身是标准 GPIO 名（PC13/PB0）都算候选。
+        # LLM 常把用户 LED 的控制脚直接命名为引脚名，旧规则只认 "led" 会漏掉。
+        bare_net = net_l.lstrip("/")
+        is_gpio_name = bool(_PORT_GROUP_RE.fullmatch(bare_net))
+        if "led" not in net_l and not is_gpio_name:
+            continue
         # 排除电源/复位/BOOT 等功能脚：按符号真实引脚名判定
         pname = ""
         if lib:
@@ -814,6 +818,12 @@ def _fix_floating_led_gpio(items, ops, lib, fixes):
             lm = re.search(r"(\d+)$", led["ref"])
             if m and lm and m.group(1) != lm.group(1):
                 continue
+            # 网名是纯 GPIO 名（PC13）时没有编号线索：只改 BOM 明确标为
+            # 「用户指示灯」的 LED，绝不误伤「电源指示灯」这类常亮灯。
+            if is_gpio_name and not m:
+                desc = f"{led.get('name','')} {led.get('desc','')}".lower()
+                if not re.search(r"用户|user", desc):
+                    continue
             for p in sorted(ops.members(a_net)):
                 rr = p.partition(":")[0]
                 it = by_ref.get(rr)
@@ -1631,6 +1641,80 @@ def _looks_uart_symbol(item, lib) -> bool:
     return bool(names & set(_UART_PIN_ROLES))
 
 
+def _mcu_uart_role(pin_name: str, net_name: str) -> str | None:
+    """按引脚名/网名判断 MCU 脚是串口发送(TX)还是接收(RX)。
+
+    通用判据：名字里含 TX/RX 语义直接用；STM32F1 的默认 USART1 脚
+    PA9=TX / PA10=RX 作为数据手册常识回退。不绑定位号、不针对单图。
+    """
+    s = f"{pin_name} {net_name}".upper()
+    has_tx = "TX" in s
+    has_rx = "RX" in s
+    if has_tx and not has_rx:
+        return "TX"
+    if has_rx and not has_tx:
+        return "RX"
+    p = pin_name.upper()
+    if p == "PA9":
+        return "TX"
+    if p == "PA10":
+        return "RX"
+    return None
+
+
+def _fix_uart_txrx_cross(items, ops, lib, fixes: list[str]) -> None:
+    """UART 芯片 TXD/RXD 与 MCU 的 TX/RX 直连（TX→TX、RX→RX）时交叉。
+
+    LLM 常把 CH340G 的 TXD 接到 MCU 的 TX(PA9)、RXD 接到 RX(PA10)——
+    两边都在「发」，串口收发都不通。ERC/视觉/safety/原功能自检全绿。
+    按符号引脚名定位 UART 的 TXD/RXD，按 _mcu_uart_role 判定 MCU 侧角色；
+    只有当 TXD 落到 MCU 的 TX 网、RXD 落到 RX 网时才对调，幂等。
+    """
+    if lib is None:
+        return
+    uarts = [it for it in items if _looks_uart_symbol(it, lib)]
+    mcus = [it for it in items if _is_mcu_item(it)]
+    if not uarts or not mcus:
+        return
+    by_ref = {it["ref"]: it for it in items}
+    for uart in uarts:
+        txd_pins = _p(uart, lib, "TXD") or _p(uart, lib, "TX")
+        rxd_pins = _p(uart, lib, "RXD") or _p(uart, lib, "RX")
+        if not txd_pins or not rxd_pins:
+            continue
+        tx_pin = f"{uart['ref']}:{next(iter(txd_pins))}"
+        rx_pin = f"{uart['ref']}:{next(iter(rxd_pins))}"
+        tx_net, rx_net = ops.name(tx_pin), ops.name(rx_pin)
+        if not tx_net or not rx_net or tx_net == rx_net:
+            continue
+
+        def mcu_role_on(net_name: str) -> tuple[str, str] | None:
+            for p in ops.members(net_name):
+                ref, _, num = p.partition(":")
+                it = by_ref.get(ref)
+                if not it or not _is_mcu_item(it):
+                    continue
+                pname = ""
+                try:
+                    pname = str(lib.pin_names(it["symbol"]).get(int(num), ""))
+                except (ValueError, TypeError):
+                    pass
+                role = _mcu_uart_role(pname, net_name)
+                if role:
+                    return role, p
+            return None
+
+        a, a_pin = mcu_role_on(tx_net) or ("", "")
+        b, b_pin = mcu_role_on(rx_net) or ("", "")
+        if a == "TX" and b == "RX" and a_pin and b_pin:
+            ops.attach(tx_pin, rx_net)
+            ops.attach(rx_pin, tx_net)
+            fixes.append(
+                f"串口交叉：{uart['ref']} 的 TXD 原接 MCU 的 TX({a_pin})、"
+                f"RXD 原接 RX({b_pin})（收发直连不通）；已对调为 "
+                f"TXD→{b_pin}、RXD→{a_pin}")
+
+
 def _fix_uart_symbol(items, ops, lib, fixes):
     """USB-UART 型号配错符号时，换成真实 UART 符号并按网络语义重映射引脚。
 
@@ -1898,6 +1982,93 @@ def _reattach_orphan_ground_pins(items, ops, fixes: list[str], lib=None) -> None
         net["pins"].remove(pin)
         fixes.append(
             f"{ref} 的地脚从孤立网 {net['name']} 归位到 {real['name']}")
+
+
+def _fix_crystal_load_caps(items, ops, lib, fixes: list[str]) -> None:
+    """给缺少 pF 负载电容的晶振网补电容，优先复用「断头」pF 电容。
+
+    LLM 常生成 22pF 电容却只把一端接 GND、另一端留在孤立网（如 C5_1），
+    随后 _drop_dead_end_passives 把它当断头件删掉，主晶振因此没有负载电容、
+    MCU 无法起振。此时晶振两脚都在网上，ERC/视觉/safety/function 全绿。
+    按结构识别：晶振脚所在网若无 pF 电容到 GND，先找一脚接 GND、另一脚在
+    孤立网的 pF 电容改接过去；没有空闲电容才新增。幂等。
+    """
+    gnd = _gnd_net(ops)
+    if not gnd:
+        return
+    crystals = [it for it in items if "crystal" in it.get("symbol", "").lower()]
+    if not crystals:
+        return
+
+    # 可复用的断头 pF 电容：一脚在 GND、另一脚在「只有它自己」的孤立网
+    spare: list[tuple[dict, str, str]] = []
+    for it in items:
+        sym = it.get("symbol", "").lower()
+        if not (sym.endswith(":c") or "电容" in str(it.get("name", ""))):
+            continue
+        if "pf" not in str(it.get("value", "")).lower():
+            continue
+        p1, p2 = f"{it['ref']}:1", f"{it['ref']}:2"
+        n1, n2 = ops.name(p1), ops.name(p2)
+        if not n1 or not n2:
+            continue
+        for fixed, gpin, lone, lpin in ((n1, p1, n2, p2), (n2, p2, n1, p1)):
+            if _GND_RE.search(fixed) and len(ops.members(lone)) == 1:
+                spare.append((it, lpin, lone))
+                break
+
+    # 情形一：两颗负载电容的另一端聚在一个「无 GND/电源/芯片成员的浮空网」
+    #（如 OSC_CAP=[C5:2, C6:2]）——把该网并入 GND，比新增电容更干净。
+    cap_nets = set()
+    for it in items:
+        if not (it.get("symbol", "").lower().endswith(":c")
+                and "pf" in str(it.get("value", "")).lower()):
+            continue
+        for p in ("1", "2"):
+            pn = f"{it['ref']}:{p}"
+            n = ops.name(pn)
+            if n and n != gnd:
+                cap_nets.add(n)
+    for n in list(cap_nets):
+        if _GND_RE.search(n) or _SUPPLY_RE.match(n):
+            continue
+        members = ops.members(n)
+        if len(members) < 2:
+            continue
+        refs = {p.partition(":")[0] for p in members}
+        its = [next((x for x in items if x["ref"] == r), None) for r in refs]
+        if not all(it and it.get("symbol", "").lower().endswith(":c")
+                   and "pf" in str(it.get("value", "")).lower() for it in its):
+            continue
+        # 全是可疑浮空 pF 电容的另一脚 → 整网并入 GND
+        for pin in list(members):
+            ops.attach(pin, gnd)
+        fixes.append(f"晶振负载电容的公共端 {n}（仅 {len(members)} 个电容脚、无地/电源）"
+                     f"实际浮空，已并入 {gnd}（否则振荡回路不成立）")
+
+    used = 0
+    for xt in crystals:
+        for p in ("1", "2"):
+            pin = f"{xt['ref']}:{p}"
+            net = ops.name(pin)
+            if not net or _has_load_cap(ops, items, net, gnd):
+                continue
+            if used < len(spare):
+                it, lpin, lone = spare[used]
+                used += 1
+                ops.attach(lpin, net)
+                fixes.append(
+                    f"复用断头电容 {it['ref']}（{it.get('value','')}）从孤立网 {lone} "
+                    f"改接 {net}，作为 {xt['ref']} 的负载电容（否则晶振不起振）")
+            else:
+                refs = [int(m.group(1)) for i in items
+                        if (m := re.fullmatch(r"C(\d+)", i["ref"]))]
+                cref = f"C{max(refs, default=0) + 1}"
+                items.append({"ref": cref, "name": "晶振负载电容", "value": "22pF",
+                              "qty": 1, "symbol": "Device:C", "footprint": ""})
+                ops.attach(f"{cref}:1", net)
+                ops.attach(f"{cref}:2", gnd)
+                fixes.append(f"新增 {cref}（22pF）作为 {xt['ref']} 的负载电容 {net}↔GND")
 
 
 def _drop_dead_end_passives(items, ops, fixes: list[str]) -> None:
@@ -2211,12 +2382,15 @@ def fix_topology(bom: dict, netlist: dict, symbol_lib=None) -> list[str]:
     _fix_uart_symbol(items, ops, symbol_lib, fixes)   # 先纠正型号/符号错配，再让 _fix_usb 补晶振
     _split_shared_crystal(items, ops, symbol_lib, fixes)  # 两芯片共用晶振→拆分，MCU 改用悬空的那颗
     _fix_usb(items, ops, symbol_lib, fixes)
+    _fix_uart_txrx_cross(items, ops, symbol_lib, fixes)  # TXD/RXD 与 MCU TX/RX 直连→对调
     _fix_usb_connector_ground(items, ops, symbol_lib, fixes)  # USB 口 GND 悬空 → 补地
     _fix_swd_breakout(items, ops, symbol_lib, fixes)  # SWD 信号只挂单脚 → 加排针引出
     _break_out_missing_io_ports(items, ops, symbol_lib, fixes)  # 整组 IO 漏接 → 加排针逐脚引出
     ops.drop_empty()
     _reattach_orphan_ground_pins(items, ops, fixes, symbol_lib)  # 孤立地脚先归位，避免被下面当断头件删掉
     _drop_half_wired_leds(items, ops, fixes)
+    ops.drop_empty()
+    _fix_crystal_load_caps(items, ops, symbol_lib, fixes)  # 晶振负载电容先补齐，别被下面断头件规则删掉
     _drop_dead_end_passives(items, ops, fixes)
     _drop_floating_passives(items, ops, fixes)
     _drop_duplicate_ghost_items(items, ops, fixes)
