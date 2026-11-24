@@ -18,6 +18,7 @@ Thumbs.db
 .dbg*.kicad_pro
 _290f_check.*
 server_run.log
+server_error.log
 *.kicad_prl
 examples/output/_tmp_*
 examples/output/schematic/_expand_*

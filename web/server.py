@@ -18,6 +18,8 @@ import subprocess
 import re
 import tempfile
 import threading
+import time
+import traceback
 import uuid
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -34,6 +36,28 @@ from src.visual_check import check as check_visual              # noqa: E402
 from src.functional_check import check_functional                # noqa: E402
 
 INDEX = Path(__file__).resolve().parent / "index.html"
+ERROR_LOG = ROOT / "server_error.log"
+
+
+def _report_exception(exc: Exception) -> str:
+    """把服务器端异常完整写到日志，并给前端返回可定位的简明信息。
+
+    过去这里只返回 `类型: 消息`（如 ValueError: too many values to unpack），
+    丢失了堆栈，导致偶发内部错误无法复盘。现在：
+      • 完整 traceback 落盘到 server_error.log（含时间）；
+      • 响应里附带最后一个业务帧的 文件:行号，用户截图即可定位。
+    """
+    tb = traceback.format_exc()
+    try:
+        with ERROR_LOG.open("a", encoding="utf-8") as fh:
+            fh.write(f"\n===== {time.strftime('%Y-%m-%d %H:%M:%S')} =====\n")
+            fh.write(tb)
+    except Exception:                       # 日志失败不能影响主流程
+        pass
+    frames = [f for f in traceback.extract_tb(exc.__traceback__)
+              if str(ROOT) in str(f.filename)]
+    loc = f" @ {Path(frames[-1].filename).relative_to(ROOT)}:{frames[-1].lineno}" if frames else ""
+    return f"{type(exc).__name__}: {exc}{loc}"
 
 
 def _kicad_cli(cfg) -> str | None:
@@ -338,7 +362,7 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 result["data"] = fn()
             except Exception as e:  # noqa: BLE001
-                result["data"] = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+                result["data"] = {"ok": False, "error": _report_exception(e)}
             ev.set()
 
         threading.Thread(target=worker, daemon=True).start()
