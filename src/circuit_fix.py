@@ -1322,6 +1322,97 @@ def _usb_data_pins(usb, lib):
     return next(iter(d_p), "3"), next(iter(d_m), "2")
 
 
+def _split_shared_crystal(items, ops, lib, fixes) -> None:
+    """修复「一颗晶振同时挂在 MCU 主时钟和 UART 的 XI/XO 上」。
+
+    LLM 常生成两颗晶振（8MHz 给 MCU、12MHz 给 USB 转串口），却把它们接成
+    同一对网：``Y1_OSC = [U1:OSC_IN, Y2:1, U2:XI, C5:1]``，而真正的 MCU
+    晶振 Y1 两脚全悬空。ERC/视觉/安全都不报（脚都在网上），只有功能自检
+    识别「主晶振悬空」。两个芯片共用一颗晶振、频率也对不上，主 MCU 无法起振。
+
+    判据（严格，保守）：
+      - 板上恰好有两颗 Device:Crystal，且一颗全部悬空、另一颗跨接两条网；
+      - 这两条网里同时含 MCU 的时钟脚（OSC_IN/OSC_OUT/PD0/PD1/PB6 等）
+        与 UART 的 XI/XO 脚——即两芯片确实被并到同一对晶振网；
+      - 悬空晶振频率低于已接晶振（8MHz<12MHz，主时钟应低于 UART 晶振时
+        才交换；若无法解析频率则跳过，不猜）。
+    修法：把 MCU 时钟脚和它的负载电容从这个共用网摘出，接到悬空晶振上；
+    UART 的 XI/XO 与已接晶振留在原网，再由 _fix_usb 补负载电容。
+    """
+    crystals = [it for it in items
+                if "crystal" in it.get("symbol", "").lower()]
+    if len(crystals) != 2:
+        return
+
+    def mhz(it):
+        m = re.search(r"(\d+(?:\.\d+)?)\s*mhz", str(it.get("value", "")), re.I)
+        return float(m.group(1)) if m else None
+
+    floating = [c for c in crystals
+                if not ops.name(f"{c['ref']}:1") and not ops.name(f"{c['ref']}:2")]
+    wired = [c for c in crystals if c not in floating]
+    if len(floating) != 1 or len(wired) != 1:
+        return
+    slow, fast = floating[0], wired[0]
+    fs, ff = mhz(slow), mhz(fast)
+    if fs is None or ff is None or not (fs < ff):
+        return
+
+    n1, n2 = ops.name(f"{fast['ref']}:1"), ops.name(f"{fast['ref']}:2")
+    if not n1 or not n2 or n1 == n2:
+        return
+    by_ref = {it["ref"]: it for it in items}
+    mcu_refs, uart_refs = set(), set()
+    for it in items:
+        if _is_mcu_item(it):
+            mcu_refs.add(it["ref"])
+        if _looks_uart_symbol(it, lib):
+            uart_refs.add(it["ref"])
+    if not mcu_refs or not uart_refs:
+        return
+    # 两条网上必须同时出现 MCU 时钟脚和 UART 的 XI/XO
+    def has(net, refs):
+        return any(p.split(":", 1)[0] in refs for p in ops.members(net))
+
+    if not (has(n1, mcu_refs) and has(n2, mcu_refs)
+            and has(n1, uart_refs) and has(n2, uart_refs)):
+        return
+
+    # MCU 时钟脚的引脚号（按符号引脚名，不硬编码）
+    mcu_clk_pins = {}
+    for ref in mcu_refs:
+        it = by_ref[ref]
+        if not lib:
+            break
+        for num, nm in lib.pin_names(it.get("symbol", "")).items():
+            if any(k in str(nm).upper()
+                   for k in ("OSC_IN", "OSC_OUT", "OSCI", "OSCO",
+                             "XTAL1", "XTAL2", "PD0", "PD1")):
+                mcu_clk_pins[f"{ref}:{num}"] = True
+    if not mcu_clk_pins:
+        return
+
+    slow_n1, slow_n2 = f"{slow['ref']}_OSC", f"{slow['ref']}_OSC2"
+    ops.ensure(slow_n1)
+    ops.ensure(slow_n2)
+    # 把 MCU 时钟脚和它们的 pF 负载电容从共用网迁到低频晶振网；
+    # UART 的 XI/XO 留在原网，继续用高频晶振。
+    for old, target in ((n1, slow_n1), (n2, slow_n2)):
+        for pin in list(ops.members(old)):
+            ref, _, num = pin.partition(":")
+            it = by_ref.get(ref, {})
+            is_clk = pin in mcu_clk_pins
+            is_cap = ("device:c" in it.get("symbol", "").lower()
+                      and "pf" in str(it.get("value", "")).lower())
+            if is_clk or is_cap:
+                ops.attach(pin, target)
+    ops.attach(f"{slow['ref']}:1", slow_n1)
+    ops.attach(f"{slow['ref']}:2", slow_n2)
+    fixes.append(
+        f"{fast['ref']}({fast.get('value','')}) 被 MCU 与 UART 共用；"
+        f"已将 MCU 时钟与负载电容迁到悬空的 {slow['ref']}({slow.get('value','')})")
+
+
 def _fix_usb(items, ops, lib, fixes):
     """CH340G + Micro-USB 时修正 D+/D− 连接、XI/XO 晶振与负载电容。
 
@@ -1748,7 +1839,7 @@ def _drop_floating_passives(items, ops, fixes: list[str]) -> None:
             f"另一端悬空；同型号的 {twin['ref']} 已正确接入）")
 
 
-def _reattach_orphan_ground_pins(items, ops, fixes: list[str]) -> None:
+def _reattach_orphan_ground_pins(items, ops, fixes: list[str], lib=None) -> None:
     """修复「无源件的地脚接在只有自己的孤立 GND 网」——如晶振负载电容
     C1:2 落在 C1_GND、C2:2 落在 C2_GND，实际并未接到真正的 GND 网。
 
@@ -1781,11 +1872,27 @@ def _reattach_orphan_ground_pins(items, ops, fixes: list[str]) -> None:
         item = next((it for it in items if it["ref"] == ref), None)
         if not item:
             continue
-        sym = item.get("symbol", "").lower()
-        if not (sym.startswith(("device:c", "device:r", "device:l"))):
+        # 不限定器件类型：LED 阴极、二极管、任意芯片的地脚都可能被 LLM 写成
+        # "<位号>_GND" 孤立网（如 LED_GND=[LED1:1]）。原来只认 C/R/L 无源件，
+        # LED 这类被漏掉，功能自检报「1 脚接在孤立网、未连任何器件」。
+        # 安全由后面两条严格判据保证：网名含 GND 语义 + 网名与本件位号对应，
+        # 因此不会把信号网或别人的地误判进来。
+        # 网名须与本件对应：完整位号（C1_GND↔C1）或去数字前缀（LED_GND↔LED1）。
+        # 同时已要求网名含 GND/VSS 语义，故 LED_CTRL 这类信号网不会被误判。
+        name_l = net["name"].lower().replace("-", "_")
+        ref_l = ref.lower().replace("-", "_")
+        prefix = re.match(r"[a-z]+", ref_l)
+        prefix = prefix.group(0) if prefix else ref_l
+        if not (ref_l in name_l or (len(prefix) >= 2 and prefix in name_l)):
             continue
-        # 网名须与位号对应，防止把 "SOME_GND_LIKE" 这种信号网误判为地
-        if ref.lower().replace("-", "_") not in net["name"].lower().replace("-", "_"):
+        # 该脚在符号里必须确实是地/阴极脚（若符号有 GND/K/Cathode 引脚名）；
+        # 查不到引脚名时退回位号对应判据（网名含本件位号已足够严格）。
+        try:
+            pname = str(lib.pin_names(item.get("symbol", "")).get(int(num), "")).lower() \
+                if lib is not None else ""
+        except Exception:
+            pname = ""
+        if pname and not any(k in pname for k in ("gnd", "vss", "k", "cath", "ground")):
             continue
         real["pins"].append(pin)
         net["pins"].remove(pin)
@@ -2016,10 +2123,11 @@ def fix_topology(bom: dict, netlist: dict, symbol_lib=None) -> list[str]:
     _fix_mcu_pins(items, ops, symbol_lib, fixes)
     _fix_swd_clock(items, ops, symbol_lib, fixes)
     _fix_uart_symbol(items, ops, symbol_lib, fixes)   # 先纠正型号/符号错配，再让 _fix_usb 补晶振
+    _split_shared_crystal(items, ops, symbol_lib, fixes)  # 两芯片共用晶振→拆分，MCU 改用悬空的那颗
     _fix_usb(items, ops, symbol_lib, fixes)
     _break_out_missing_io_ports(items, ops, symbol_lib, fixes)  # 整组 IO 漏接 → 加排针逐脚引出
     ops.drop_empty()
-    _reattach_orphan_ground_pins(items, ops, fixes)  # 孤立地脚先归位，避免被下面当断头件删掉
+    _reattach_orphan_ground_pins(items, ops, fixes, symbol_lib)  # 孤立地脚先归位，避免被下面当断头件删掉
     _drop_half_wired_leds(items, ops, fixes)
     _drop_dead_end_passives(items, ops, fixes)
     _drop_floating_passives(items, ops, fixes)

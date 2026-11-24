@@ -1468,17 +1468,16 @@ def write_schematic(netlist: dict, bom: dict, output_path, symbols_dir,
                 continue
             # 锚点与角度已由 ⑥b 按最终 stub/early-tap 位置统一排过重叠
             lx, ly, langle, _cells = final_label_plan[(key, i)]
-            if job["label_route"]:
-                # 带方框的全局标签：一眼看出是「同名端口有意连接」，不是断线。
-                # 文字居中（与普通 label 一致），避让/自检用同一套包围盒。
-                L.append(f'  (global_label "{name}"')
-                L.append('    (shape passive)')
-                L.append(f"    (at {_fmt(lx)} {_fmt(ly)} {langle})")
-                L.append('    (effects (font (size 1.27 1.27)))')
-            else:
-                L.append(f'  (label "{name}"')
-                L.append(f"    (at {_fmt(lx)} {_fmt(ly)} {langle})")
-                L.append('    (effects (font (size 1.27 1.27)))')
+            # 长距离同名连接一律用**无框** label：同页同名即连通（KiCad 规则），
+            # ERC/网表与全局标签完全一致（已用 kicad-cli 导出网表逐网比对）。
+            # 旧版用带框 global_label，但 KiCad 8 的 passive 框固定从锚点向右
+            # 展开（与 angle/justify/shape 无关，实测），当导线也从右侧进入
+            # 锚点（芯片左脚向左引出）时，框会压住 2~11mm 绿色导线，视觉上
+            # 像把线截断。无框同名标保留「一眼看出是有意同名连接」的好处，
+            # 又不再遮挡导线。分类名由 label_route 决定，只影响画法不影响电气。
+            L.append(f'  (label "{name}"')
+            L.append(f"    (at {_fmt(lx)} {_fmt(ly)} {langle})")
+            L.append('    (effects (font (size 1.27 1.27)))')
             L.append(f'    (uuid "{_u()}")')
             L.append("  )")
             # 登记真实标签锚点：线头裁剪要用它保护「导线恰好终止于标签」的
