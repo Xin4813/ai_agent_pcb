@@ -12,6 +12,68 @@ import re
 from .safety import _pins, _GND_RE
 
 _SUPPLY_RE = re.compile(r"^(vcc|vdd|vbus|\+?\d+(?:\.\d+)?v|3v3|5v|vin)", re.I)
+_VOLTAGE_RE = re.compile(r"(\d+(?:\.\d+)?)\s*v", re.I)
+_ICL7660_RE = re.compile(r"icl7660", re.I)
+
+
+def _net_voltage(netname: str, net_pins: dict, by_ref: dict, symbol_lib=None) -> float | None:
+    """从网名或网内稳压器型号推断该网的标称电压（V）。推断不出返回 None。"""
+    m = _VOLTAGE_RE.search(netname or "")
+    if m:
+        return float(m.group(1))
+    if symbol_lib:
+        for ref, _pin in net_pins.get(netname, ()):
+            it = by_ref.get(ref, {})
+            if "regulator" not in str(it.get("symbol", "")).lower():
+                continue
+            m = _VOLTAGE_RE.search(str(it.get("value", "")))
+            if m:
+                return float(m.group(1))
+    return None
+
+
+def _check_icl7660_lv(items: list, by_ref: dict, pin_net: dict, net_pins: dict,
+                      symbol_lib=None) -> tuple[list[str], int]:
+    """ICL7660 数据手册硬规则：LV 脚接法取决于 V+ 电压。
+
+    V+ ≥ 5V 时 LV 必须悬空；接到 VOUT 会旁路内部稳压器、造成工作点漂移甚至闩锁。
+    V+ ≤ 3.5V 时 LV 必须接 GND；悬空则低压模式失效。
+    ERC 只看电气规则、视觉只看几何，都查不出这类「连上了但芯片不能正常工作」。
+    """
+    issues: list[str] = []
+    checked = 0
+    for it in items:
+        ident = " ".join(str(it.get(k, "")) for k in ("value", "name", "symbol"))
+        if not _ICL7660_RE.search(ident):
+            continue
+        checked += 1
+        ref = it.get("ref", "")
+        names: dict = {}
+        if symbol_lib:
+            try:
+                names = symbol_lib.pin_names(it.get("symbol", ""))
+            except Exception:
+                names = {}
+        lv = [str(n) for n, nm in names.items() if str(nm).strip().upper() == "LV"] or ["6"]
+        vp = [str(n) for n, nm in names.items()
+              if str(nm).strip().upper() in ("V+", "VCC", "VDD")] or ["8"]
+        vplus_net = pin_net.get((ref, vp[0]))
+        lv_net = pin_net.get((ref, lv[0]))
+        if not vplus_net:
+            continue                      # V+ 本身没接，由电源脚悬空规则负责
+        volt = _net_voltage(vplus_net, net_pins, by_ref, symbol_lib)
+        if volt is None or lv_net is None:
+            continue                      # 电压不可判定，或 LV 已正确悬空
+        if volt >= 4.5:
+            issues.append(
+                f"{ref}（ICL7660）供电 {vplus_net}={volt:g}V，数据手册要求 LV({lv[0]}) 悬空，"
+                f"当前却接到 {lv_net}（会旁路内部稳压器）")
+        elif volt <= 3.5 and not _GND_RE.search(lv_net):
+            issues.append(
+                f"{ref}（ICL7660）供电 {vplus_net}={volt:g}V 为低压模式，"
+                f"LV({lv[0]}) 必须接 GND，当前接到 {lv_net}")
+    return issues, checked
+
 
 # 这些脚悬空是正常的，不算功能性错误。
 _NORMAL_FLOAT = re.compile(
@@ -130,6 +192,12 @@ def check_functional(bom: dict, netlist: dict, symbol_lib=None) -> dict:
             if ni & no and None not in ni | no:
                 issues.append(f"稳压器 {it['ref']} 输入/输出脚同网 {ni & no}，被短接")
         checked += 1
+
+    # 4b) 数据手册级硬规则：ICL7660 的 LV 脚接法随 V+ 电压变化。
+    #     5V 供电时必须悬空，接到 VOUT 不为 ERC/视觉/safety 所见，却会让芯片失效。
+    lv_issues, lv_checked = _check_icl7660_lv(items, by_ref, pin_net, net_pins, symbol_lib)
+    issues.extend(lv_issues)
+    checked += lv_checked
 
     # 5) LED 阴阳极不能同网（短路）
     leds: list[dict] = []

@@ -55,6 +55,8 @@ python -m src.cli "帮我设计一块 Arduino 最小系统板" --mock -i
 python web/server.py            # 然后浏览器打开 http://127.0.0.1:8000
 ```
 
+> **修改代码或知识库模板后必须重启网页服务**：`web/server.py` 是常驻进程，Python 模块与内置模板在启动时一次性载入内存；之后只改文件、提交或 push，运行中的网站仍会用旧逻辑/旧模板生成原理图。重启后再用 `python tests/audit_full.py` 做一次五维回归，确认 ERC / 布局 / 安全 / 功能 / 拓扑修复均为 0。
+
 ## 5. ERC 电气规则校验
 生成原理图后，可用 KiCad 命令行做校验（`src/kicad_writer.py` 已把符号库内嵌进 `.kicad_sch`，因此 `kicad-cli` 能独立解析）：
 ```bash
