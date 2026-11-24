@@ -84,6 +84,15 @@ def check_functional(bom: dict, netlist: dict, symbol_lib=None) -> dict:
                 continue
             if (it["ref"], n) not in pin_net:
                 issues.append(f"{it['ref']}（{it.get('value','')}）的 {n}({nm or '脚'}) 悬空")
+                continue
+            # 引脚虽在某个网里，但该网只有它自己一个成员——这是一根没有
+            # 连接到任何其它器件的线头（如断头限流电阻接在孤立 "LED" 网）。
+            # ERC/视觉都看不出：引脚"已连接"，但电路里它不起作用。
+            lone = net_pins.get(pin_net[(it["ref"], n)], set())
+            if len(lone) == 1:
+                issues.append(
+                    f"{it['ref']}（{it.get('value','')}）的 {n} 脚接在孤立网 "
+                    f"{pin_net[(it['ref'], n)]}（仅此一脚，未连任何器件）")
         checked += 1
 
     # 3) 有源芯片的电源/地脚必须接网（排除 NC 脚与明确标注不接的脚）

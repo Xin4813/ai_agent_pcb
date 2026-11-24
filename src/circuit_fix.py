@@ -1585,6 +1585,7 @@ def _drop_dead_end_passives(items, ops, fixes: list[str]) -> None:
       - 元件未被其它修正规则在本轮复用（复用后两端都有网，自然不满足）。
     """
     used = {p: n["name"] for n in ops.nets for p in n["pins"]}
+    members = {n["name"]: set(n["pins"]) for n in ops.nets}
     for it in list(items):
         sym = it.get("symbol", "").lower()
         if not (sym.startswith("device:c") or sym.startswith("device:r")
@@ -1593,17 +1594,32 @@ def _drop_dead_end_passives(items, ops, fixes: list[str]) -> None:
         ref = it["ref"]
         p1, p2 = f"{ref}:1", f"{ref}:2"
         n1, n2 = used.get(p1), used.get(p2)
-        if bool(n1) == bool(n2):       # 必须恰好一端接网
-            continue
-        attached, net_name = (p1, n1) if n1 else (p2, n2)
-        # 接网端必须是电源或信号网（不能是 GND，那由 _drop_floating_passives 处理）
-        if _GND_RE.search(net_name or ""):
+        dead_pin = None
+        reason = None
+        if bool(n1) != bool(n2):
+            # 情形一：一端接网、另一端完全不在网表（经典断头）
+            dead_pin = (p1, p2)[not bool(n1)]
+            name = n1 or n2
+            if _GND_RE.search(name or ""):     # 交给 _drop_floating_passives
+                continue
+            reason = f"另一脚悬空"
+        elif n1 and n2 and n1 != n2:
+            # 情形二：一端接 GND/电源、另一端接在「只有它自己」的孤立网
+            # （LLM 把限流电阻接成 "R→孤立LED网" 的死支路，ERC/功能自检曾漏过）
+            for fixed_pin, fixed_net, lone_pin, lone_net in (
+                    (p1, n1, p2, n2), (p2, n2, p1, n1)):
+                if not (_GND_RE.search(fixed_net) or _SUPPLY_RE.match(fixed_net)):
+                    continue
+                if len(members.get(lone_net, ())) == 1 and lone_pin in members[lone_net]:
+                    dead_pin = lone_pin
+                    reason = f"{lone_net} 网仅有此一脚（孤立线头）"
+                    break
+        if not dead_pin:
             continue
         ops.remove_component(ref, [p1, p2])
         items[:] = [x for x in items if x is not it]
         fixes.append(
-            f"删除断头无源件 {ref}（{it.get('value','')}，仅 {attached.split(':')[1]} "
-            f"脚接 {net_name}、另一脚悬空，不构成回路）")
+            f"删除断头无源件 {ref}（{it.get('value','')}，{reason}，不构成回路）")
 
 
 def _drop_half_wired_leds(items, ops, fixes: list[str]) -> None:

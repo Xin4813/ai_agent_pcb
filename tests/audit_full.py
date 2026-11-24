@@ -1,4 +1,4 @@
-"""全量回归审计：对 web_sessions 下每个会话检查四个维度。
+"""全量回归审计：对 web_sessions 下每个会话检查五个维度。
 
 用法：
   python tests/audit_full.py                 # 全部会话
@@ -9,6 +9,7 @@
   2. safety.check_electrical 安全告警数
   3. visual_check 视觉 error 数
   4. kicad-cli sch erc 违规数
+  5. functional_check 功能自检（基于修复后网表，抓 ERC/视觉查不出的硬错误）
 退出码：任一维度非 0 则为 1。
 """
 from __future__ import annotations
@@ -24,6 +25,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from src.circuit_fix import fix_topology  # noqa: E402
+from src.functional_check import check_functional  # noqa: E402
 from src.safety import check_electrical  # noqa: E402
 from src.symbol_lib import SymbolLib  # noqa: E402
 from src.visual_check import check as visual_check  # noqa: E402
@@ -56,8 +58,8 @@ def main(argv: list[str]) -> int:
     lib = SymbolLib(str(SYMDIR)) if SYMDIR.exists() else None
     only = set(argv[1:])
     print(f"符号库: {'已加载' if lib else '未加载'}  KiCad CLI: {'可用' if CLI.exists() else '不可用'}")
-    print(f"{'会话':<12} {'fix':>4} {'安全':>4} {'视觉':>4} {'ERC':>4}")
-    print("-" * 36)
+    print(f"{'会话':<12} {'fix':>4} {'安全':>4} {'视觉':>4} {'ERC':>4} {'功能':>4}")
+    print("-" * 41)
     bad = 0
     sessions = [d for d in sorted(SESS.iterdir()) if d.is_dir()]
     for d in sessions:
@@ -69,16 +71,23 @@ def main(argv: list[str]) -> int:
         bom = json.loads(bom_p.read_text(encoding="utf-8"))
         nl = json.loads(nl_p.read_text(encoding="utf-8"))
 
-        fixes = fix_topology(copy.deepcopy(bom), copy.deepcopy(nl), lib)
-        warns = check_electrical(bom, nl, lib)
+        fixed_bom, fixed_nl = copy.deepcopy(bom), copy.deepcopy(nl)
+        fixes = fix_topology(fixed_bom, fixed_nl, lib)
+        warns = check_electrical(fixed_bom, fixed_nl, lib)
+        # 功能自检必须基于「修复后」的网表，与网页返回口径一致；否则
+        # 断头件等修复动作会被误报为功能失败。
+        fn = check_functional(fixed_bom, fixed_nl, lib)
+        fn_bad = len(fn.get("issues", []))
 
         sch_dir = d / "schematic"
         schs = sorted(sch_dir.glob("*.kicad_sch")) if sch_dir.exists() else []
         verr = sum(visual_check(s)["error_count"] for s in schs)
         erc = erc_count(schs[0], d / "_audit.erc.txt") if schs else -1
 
-        flag = "" if (not fixes and not warns and not verr and erc == 0) else "  <== 问题"
-        print(f"{d.name:<12} {len(fixes):>4} {len(warns):>4} {verr:>4} {erc:>4}{flag}")
+        flag = "" if (not fixes and not warns and not verr and erc == 0
+                      and fn_bad == 0) else "  <== 问题"
+        print(f"{d.name:<12} {len(fixes):>4} {len(warns):>4} {verr:>4} {erc:>4} "
+              f"{fn_bad:>4}{flag}")
         if fixes:
             for f in fixes:
                 print(f"    [fix] {f}")
@@ -90,9 +99,11 @@ def main(argv: list[str]) -> int:
                 for it in r["issues"]:
                     if it["severity"] == "error":
                         print(f"    [视觉] {it['type']}: {it['detail']}")
-        if fixes or warns or verr or erc != 0:
+        for f in fn.get("issues", []):
+            print(f"    [功能] {f}")
+        if fixes or warns or verr or erc != 0 or fn_bad:
             bad += 1
-    print("-" * 36)
+    print("-" * 41)
     print(f"合计 {bad} 个会话存在问题")
     return 1 if bad else 0
 
