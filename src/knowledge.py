@@ -158,7 +158,11 @@ def _adj_psu() -> dict:
                 {"name": "VCC_5V", "pins": ["U1:2", "C2:1", "U2:8"]},
                 {"name": "CAP_POS", "pins": ["U2:2", "C3:1"]},
                 {"name": "CAP_NEG", "pins": ["U2:4", "C3:2"]},
-                {"name": "VNEG", "pins": ["U2:5", "U2:6", "C4:1", "RP1:2", "RP1:3"]},
+                # ICL7660 的 6 脚是 LV（低电压操作脚）：datasheet 规定供电 <3.5V 时接 GND、
+                # ≥5V 时必须悬空(leave open)。这里供电是 LM1117 给的 +5V，故 LV 必须悬空，
+                # 绝不能接到 VOUT(VNEG)——否则内部稳压器被旁路、工作点不确定甚至闩锁。
+                # 不在网表里的引脚由 kicad_writer 自动打 no_connect（×），正是 leave open。
+                {"name": "VNEG", "pins": ["U2:5", "C4:1", "RP1:2", "RP1:3"]},
                 {"name": "VOUT", "pins": ["U3:2", "R1:1", "C5:1", "J2:1"]},
                 {"name": "ADJ", "pins": ["U3:1", "R1:2", "RP1:1"]},
             ]
