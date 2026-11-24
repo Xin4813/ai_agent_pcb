@@ -34,6 +34,11 @@ _POWER_RE = re.compile(
     r"^(vcc|vdd|vss|vee|gnd|agnd|dgnd|avcc|avdd|\+?\d+(?:\.\d+)?v)$", re.I)
 
 GRID = 1.27          # KiCad 默认栅格 50 mil
+# 长距离点对点信号网改用「两端同名全局标签」连接的跨度阈值（mm）。
+#  rationale：跨越大半个芯片/排针的长导线既容易绕不开、退化成两端小标签的
+# 「视觉断线」，又让图面拥挤。主动统一改用带方框的全局标签（一眼可辨是同名
+# 端口连接），图面清爽且风格一致。仅限 2 端点、非电源的网络；多端点网仍走实线。
+LABEL_SPAN_MM = 35.0
 STUB = 7.62          # 引脚引出线长度（6mm：引出点在符号体外，短线+标签即可；
                      # 且 |引脚偏移|+7.62 ≤ 包围盒半高(=|引脚偏移|+12)，导线永远
                      # 伸不出自己的格子，结构上杜绝与相邻元件的导线共线重叠）
@@ -981,9 +986,20 @@ def write_schematic(netlist: dict, bom: dict, output_path, symbols_dir,
         if len(ends) < 2:
             continue
 
+        needs_flag = _net_needs_flag(net)
+        # 通用「长线标签化」判定（纯几何 + 电气类型，不看网名/位号）：
+        #   恰好 2 个端点、非电源网、两端跨度超过阈值 → 用两端同名全局标签
+        #   连接，跳过横穿长导线。电源主干与多端点网仍走实线，保持直观。
+        xs = [e[0] for e in ends] + [e[2] for e in ends]
+        ys = [e[1] for e in ends] + [e[3] for e in ends]
+        span = max(max(xs) - min(xs), max(ys) - min(ys))
+        label_route = (len(ends) == 2 and not needs_flag
+                       and span >= LABEL_SPAN_MM)
+
         net_jobs.append({"key": len(net_jobs), "name": name, "ends": ends,
-                         "flag": None, "needs_flag": _net_needs_flag(net),
+                         "flag": None, "needs_flag": needs_flag,
                          "touched": set(),
+                         "label_route": label_route, "span": span,
                          "refs": {r for r, _k in ok}})
 
     # ② PWR_FLAG 位置：所有网络的引出线都收集完后统一排布。
@@ -1292,6 +1308,10 @@ def write_schematic(netlist: dict, bom: dict, output_path, symbols_dir,
         return (-len(pts), total, kv[0])
 
     for key, job in sorted(enumerate(net_jobs), key=_order):
+        # 长距离点对点信号：两端各留短 stub + 同名全局标签即可，
+        # 不画横穿全图的长导线（图面清爽、风格统一、不会绕不开而断线）。
+        if job["label_route"]:
+            continue
         pts = [_to_grid(e[2], e[3]) for e in job["ends"]]
         if job["flag"]:
             pts.append(_to_grid(job["flag"][0], job["flag"][1]))
@@ -1349,7 +1369,16 @@ def write_schematic(netlist: dict, bom: dict, output_path, symbols_dir,
             ga, gb = _to_grid(ax, ay), _to_grid(lx, ly)
             cells = list(_cells_between(ga, gb))
             cells.reverse()          # 从锚点往引脚方向，锚点始终在已画导线上
-            cands = [(gb, a) for a in (orig, 90)]
+            # 全局标签给更多候选：既可调角度，也可沿引出线 stub 往引脚方向
+            # 平移锚点（电气不变——仍在同一条 stub 上）。这样两个从相反
+            # 方向引出、末端碰巧落在同一行的标签能各自退开、不再互压。
+            lab_global = job["label_route"]
+            if lab_global:
+                # cells 已按「从锚点往引脚」排序；跳过第 0 格（原位只调角度）
+                slide_cells = [gb] + cells[1:]
+                cands = [(c, a) for c in slide_cells for a in (orig, 90)]
+            else:
+                cands = [(gb, a) for a in (orig, 90)]
             label_items.append({"key": (job["key"], i), "text": job["name"],
                                 "x": lx, "y": ly, "cell": gb,
                                 "orig": orig, "angle": orig, "cands": cands})
@@ -1435,9 +1464,17 @@ def write_schematic(netlist: dict, bom: dict, output_path, symbols_dir,
                 continue
             # 锚点与角度已由 ⑥b 按最终 stub/early-tap 位置统一排过重叠
             lx, ly, langle, _cells = final_label_plan[(key, i)]
-            L.append(f'  (label "{name}"')
-            L.append(f"    (at {_fmt(lx)} {_fmt(ly)} {langle})")
-            L.append('    (effects (font (size 1.27 1.27)))')
+            if job["label_route"]:
+                # 带方框的全局标签：一眼看出是「同名端口有意连接」，不是断线。
+                # 文字居中（与普通 label 一致），避让/自检用同一套包围盒。
+                L.append(f'  (global_label "{name}"')
+                L.append('    (shape passive)')
+                L.append(f"    (at {_fmt(lx)} {_fmt(ly)} {langle})")
+                L.append('    (effects (font (size 1.27 1.27)))')
+            else:
+                L.append(f'  (label "{name}"')
+                L.append(f"    (at {_fmt(lx)} {_fmt(ly)} {langle})")
+                L.append('    (effects (font (size 1.27 1.27)))')
             L.append(f'    (uuid "{_u()}")')
             L.append("  )")
             # 登记真实标签锚点：线头裁剪要用它保护「导线恰好终止于标签」的

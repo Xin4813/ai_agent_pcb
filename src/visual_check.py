@@ -92,6 +92,18 @@ def parse_schematic(path) -> dict:
 
     flat = re.sub(r'\s+', ' ', s)   # KiCad 会把 wire/label 的 xy 放在同一行
 
+    # 普通 label 与带方框的 global_label 都算网络标签：后者是长距离点对点
+    # 信号主动采用的连接形式，若不识别会把它的锚点误判成悬空线头。
+    # global_label 也可能带 (shape ...) / (justify ...) 等字段，用宽松匹配。
+    for lm in re.finditer(
+            r'\(global_label "([^"]*)"', flat):
+        seg = flat[lm.start():lm.start() + 220]
+        at = re.search(r'\(at ([-\d.]+) ([-\d.]+) ([-\d.]+)\)', seg)
+        if at:
+            texts.append({"kind": "GlobalLabel", "text": lm.group(1),
+                          "x": float(at.group(1)), "y": float(at.group(2)),
+                          "angle": int(float(at.group(3))) % 360,
+                          "center": False, "is_label": True})
     for lm in re.finditer(r'\(label "([^"]*)" \(at ([-\d.]+) ([-\d.]+) ([-\d.]+)\)', flat):
         texts.append({"kind": "Label", "text": lm.group(1),
                       "x": float(lm.group(2)), "y": float(lm.group(3)),
