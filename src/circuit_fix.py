@@ -21,6 +21,7 @@ from .safety import _pins, _regulator_output, _chip_vcc, _GND_RE
 
 _SUPPLY_RE = re.compile(r"^(vcc|vdd|vbus|\+?\d+(?:\.\d+)?v|3v3|5v)", re.I)
 _V33_NAME_RE = re.compile(r"3v3|\+3\.3|3\.3v", re.I)
+_PORT_GROUP_RE = re.compile(r"^([A-Za-z]{1,2})(\d+)$")
 
 
 def _find(items, *keys):
@@ -1923,6 +1924,83 @@ def _fix_swd_clock(items, ops, lib, fixes: list[str]) -> None:
         f"（调试器可提供时钟）")
 
 
+def _unique_net_name(ops: _Nets, base: str) -> str:
+    """给新引出的 IO 取一个不与现有网络冲突的名字。"""
+    name = base
+    i = 2
+    while any(n.get("name") == name for n in ops.nets):
+        name = f"{base}_{i}"
+        i += 1
+    return name
+
+
+def _break_out_missing_io_ports(items, ops, lib, fixes: list[str]) -> None:
+    """整组 IO 一个都没接、而同芯片别的端口已引出时，自动加排针逐脚引出。
+
+    这是「功能自检报整组 IO 漏接」对应的修复动作。规则不绑定具体芯片或
+    端口字母：按符号引脚名里的 PA0/PB3/PC14 这类端口组识别，只要某组
+    完全没出现在网表里，就新增一个与组内 IO 数量相同的排针并逐脚连接。
+    单个未用 GPIO 不在此列——只处理「整组全丢」这种明显漏接。
+    """
+    if not lib:
+        return
+    connected = {p for n in ops.nets for p in n.get("pins", [])}
+    for it in items:
+        sym = str(it.get("symbol", ""))
+        sl = sym.lower()
+        if not ("mcu_" in sl or "rf_module" in sl or "soc_" in sl):
+            continue
+        ref = it.get("ref", "")
+        try:
+            names = lib.pin_names(sym)
+        except Exception:
+            continue
+        groups: dict[str, list[tuple[int, int]]] = {}
+        for pin, nm in names.items():
+            m = _PORT_GROUP_RE.match(str(nm).strip())
+            if m:
+                groups.setdefault(m.group(1).upper(), []).append((int(m.group(2)), int(pin)))
+        if len(groups) < 2:
+            continue
+        wired_pins = {
+            int(p.partition(":")[2]) for p in connected
+            if p.partition(":")[0] == ref and p.partition(":")[2].isdigit()
+        }
+        wired_groups = {
+            g for g, entries in groups.items()
+            if any(pin in wired_pins for _logical, pin in entries)
+        }
+        if not wired_groups:
+            continue
+        for prefix, entries in sorted(groups.items()):
+            if prefix in wired_groups:
+                continue
+            entries.sort()
+            count = len(entries)
+            sym_id = f"Connector:Conn_01x{count:02d}_Pin"
+            try:
+                lib.pin_numbers(sym_id)
+            except Exception:
+                continue                      # 符号库没有对应排针，跳过而不猜引脚号
+            jref = _add_ref(items, "J")
+            items.append({
+                "ref": jref,
+                "name": f"{prefix} IO 扩展排针",
+                "value": f"{prefix}0-{prefix}{entries[-1][0]}",
+                "qty": 1,
+                "symbol": sym_id,
+                "footprint": "",
+                "desc": f"引出 {it.get('value', '')} 的 {prefix} 端口 IO",
+            })
+            for idx, (logical, pin) in enumerate(entries, start=1):
+                netname = _unique_net_name(ops, f"{prefix}{logical}")
+                ops.attach(f"{ref}:{pin}", netname)
+                ops.attach(f"{jref}:{idx}", netname)
+            fixes.append(
+                f"{ref}（{it.get('value', '')}）整组 {prefix} IO 未引出，"
+                f"新增 {jref}（{count}Pin）并逐脚连接到 {prefix}0…{prefix}{entries[-1][0]}")
+
+
 def fix_topology(bom: dict, netlist: dict, symbol_lib=None) -> list[str]:
     """就地修正可检测到的拓扑错误，返回修正说明列表。"""
     items = bom.get("items", [])
@@ -1939,6 +2017,7 @@ def fix_topology(bom: dict, netlist: dict, symbol_lib=None) -> list[str]:
     _fix_swd_clock(items, ops, symbol_lib, fixes)
     _fix_uart_symbol(items, ops, symbol_lib, fixes)   # 先纠正型号/符号错配，再让 _fix_usb 补晶振
     _fix_usb(items, ops, symbol_lib, fixes)
+    _break_out_missing_io_ports(items, ops, symbol_lib, fixes)  # 整组 IO 漏接 → 加排针逐脚引出
     ops.drop_empty()
     _reattach_orphan_ground_pins(items, ops, fixes)  # 孤立地脚先归位，避免被下面当断头件删掉
     _drop_half_wired_leds(items, ops, fixes)
