@@ -415,6 +415,17 @@ def _fix_dangling_chip_power(items, ops, lib, fixes: list[str]) -> None:
                 break
     if not rail:
         return
+    gnd = _gnd_net(ops)
+    # 3.3V 芯片的全部供电脚，用于识别「供电脚 + 退耦电容」组成的孤立支路。
+    power_pins: set[str] = set()
+    for it in items:
+        need = _chip_vcc(it)
+        if need is None or need > 3.6:
+            continue
+        for name in ("VDD", "VBAT", "VDDA", "VCC"):
+            for p in _p(it, lib, name):
+                power_pins.add(f"{it['ref']}:{p}")
+
     for it in items:
         need = _chip_vcc(it)
         if need is None or need > 3.6:
@@ -424,6 +435,37 @@ def _fix_dangling_chip_power(items, ops, lib, fixes: list[str]) -> None:
                 pin = f"{it['ref']}:{p}"
                 net = ops.name(pin)
                 if net and len(ops.members(net)) > 1:
+                    # 「VDDA 脚 + 一只电容，电容另一端留在 C8_2 这类孤立网」
+                    # 不是真实供电/滤波网络：电源脚没接到 3.3V，退耦也不成立。
+                    # 判据：该网成员只能是 3.3V 芯片供电脚 + 电容脚，且每只电容
+                    # 的另一端是悬空或仅自身的孤立网（不能是 GND/电源/信号网）。
+                    stub_caps: list[tuple[str, str]] = []
+                    stub_ok = bool(gnd)
+                    for other in ops.members(net):
+                        if other in power_pins:
+                            continue
+                        ref, _sep, num = other.partition(":")
+                        cit = next((x for x in items if x["ref"] == ref), None)
+                        sym = (cit or {}).get("symbol", "").lower()
+                        if not (sym.startswith("device:c") or "电容" in str((cit or {}).get("name", ""))):
+                            stub_ok = False
+                            break
+                        opposite = f"{ref}:{'2' if num == '1' else '1'}"
+                        oname = ops.name(opposite)
+                        if oname and (len(ops.members(oname)) > 1 or _GND_RE.search(oname)):
+                            stub_ok = False
+                            break
+                        stub_caps.append((other, opposite))
+                    if stub_ok and stub_caps:
+                        for pp in sorted(p for p in ops.members(net) if p in power_pins):
+                            ops.attach(pp, rail)
+                        for cap_pin, opposite in stub_caps:
+                            ops.attach(cap_pin, rail)
+                            ops.attach(opposite, gnd)
+                        fixes.append(
+                            f"{pin}（{name}）原在 {net} 只与退耦电容组成孤立支路，"
+                            f"已把 {name} 和电容并入 {rail}、电容另一端接 {gnd}")
+                        continue
                     continue                   # 已有真实供电/滤波网络
                 ops.attach(pin, rail)
                 fixes.append(
