@@ -1385,7 +1385,10 @@ def write_schematic(netlist: dict, bom: dict, output_path, symbols_dir,
                 cands = [(gb, a) for a in (orig, 90)]
             label_items.append({"key": (job["key"], i), "text": job["name"],
                                 "x": lx, "y": ly, "cell": gb,
-                                "orig": orig, "angle": orig, "cands": cands})
+                                "orig": orig, "angle": orig, "cands": cands,
+                                "pin_cell": ga, "stub_cells": cells, "stub_end": gb,
+                                "pin": (ax, ay), "stub": (ex, ey),
+                                "label_route": job["label_route"]})
 
     _CHAR_W, _TEXT_H = 1.27, 1.27
     fixed_boxes = []
@@ -1420,21 +1423,79 @@ def write_schematic(netlist: dict, bom: dict, output_path, symbols_dir,
         lab["cell"], lab["angle"] = cand
         lab["x"], lab["y"] = _from_grid(*cand[0])
 
-    for _pass in range(6):
-        changed = False
+    def _relax_passes():
+        for _pass in range(6):
+            changed = False
+            for lab in label_items:
+                before = _total_clash()
+                best = ((lab["cell"], lab["angle"]), before)
+                for cand in lab["cands"]:
+                    _apply(lab, cand)
+                    cost = _total_clash()
+                    if cost < best[1]:
+                        best = (cand, cost)
+                _apply(lab, best[0])
+                if best[1] < before:
+                    changed = True
+            if not changed:
+                break
+
+    def _anchor_wire_cells(key, x, y) -> set:
+        """锚点所在同网导线上的全部栅格点（标签只能在这些点上滑动）。"""
+        out = set()
+        cx, cy = _to_grid(x, y)
+        for x1, y1, x2, y2, k in wire_buffer:
+            if k != key:
+                continue
+            if abs(y1 - y2) < 0.01 and abs(y1 - y) < 0.01 \
+                    and min(x1, x2) - 0.01 <= x <= max(x1, x2) + 0.01:
+                a, b = _to_grid(min(x1, x2), y1)[0], _to_grid(max(x1, x2), y1)[0]
+                out.update((i, cy) for i in range(a, b + 1))
+            if abs(x1 - x2) < 0.01 and abs(x1 - x) < 0.01 \
+                    and min(y1, y2) - 0.01 <= y <= max(y1, y2) + 0.01:
+                a, b = _to_grid(x1, min(y1, y2))[1], _to_grid(x1, max(y1, y2))[1]
+                out.update((cx, j) for j in range(a, b + 1))
+        return out
+
+    _relax_passes()
+    # 已有候选（沿 stub 往引脚滑 + 改竖排）仍消不掉重叠时，给标签更多候选：
+    #   - 锚点不在导线上（长距离同名标，线头已被裁掉）→ 可小幅自由平移；
+    #   - 锚点确实落在导线上 → 只沿 stub 向外延伸几格，并同步延长引出线。
+    # 两种情况都不改变网络的电气连接，锚点仍在本网线上或仍靠同名连通。
+    if _total_clash():
         for lab in label_items:
-            before = _total_clash()
-            best = ((lab["cell"], lab["angle"]), before)
-            for cand in lab["cands"]:
-                _apply(lab, cand)
-                cost = _total_clash()
-                if cost < best[1]:
-                    best = (cand, cost)
-            _apply(lab, best[0])
-            if best[1] < before:
-                changed = True
-        if not changed:
-            break
+            ga, gb = lab["pin_cell"], lab["stub_end"]
+            lx, ly = lab["x"], lab["y"]
+            wire_cells = _anchor_wire_cells(lab["key"][0], lx, ly)
+            # 引脚引出线要等优化之后才真正 _wire()，此时还没进 wire_buffer；
+            # 但它同样是标签锚点所在的导线，必须一并作为可滑动范围。
+            wire_cells.update(lab["stub_cells"])
+            # 锚点在长距离同名标上且没有导线：可小幅自由平移；锚点在导线上：
+            # 只能沿该网导线滑动，绝不能挪到别的网名标签附近（ERC 会串网）。
+            free = not wire_cells
+            extra_cells = set()
+            if free:
+                bx, by = _to_grid(lx, ly)
+                extra_cells.update((bx + dx, by + dy)
+                                   for dx in range(-4, 5) for dy in range(-2, 3))
+            else:
+                extra_cells.update(wire_cells - {(gb[0], gb[1])})
+                step = ((gb[0] > ga[0]) - (gb[0] < ga[0]),
+                        (gb[1] > ga[1]) - (gb[1] < ga[1]))
+                if step != (0, 0):
+                    extra_cells.update((gb[0] + step[0] * k, gb[1] + step[1] * k)
+                                       for k in range(1, 5))
+            for cell in extra_cells:
+                x, y = _from_grid(*cell)
+                hw = max(1, len(lab["text"])) * _CHAR_W / 2
+                if not (2 <= x <= pw - 2 and 2 <= y <= ph - 2) \
+                        or _in_title_block(x, y, hw, _TEXT_H / 2, paper):
+                    continue
+                for a in (lab["orig"], 90):
+                    cand = (cell, a)
+                    if cand not in lab["cands"]:
+                        lab["cands"].append(cand)
+        _relax_passes()
 
     final_label_plan = {}
     for lab in label_items:
@@ -1455,6 +1516,16 @@ def write_schematic(netlist: dict, bom: dict, output_path, symbols_dir,
             if touched and i not in touched:
                 continue
             tex, tey = stub_trim.get((key, i), (ex, ey))
+            # 标签避让可能把锚点移到 stub 外侧：把引出线同步延长到新锚点，
+            # 否则文字画在线头之外，锚点悬空且 ERC 会报 label_dangling。
+            if job["label_route"] and (key, i) in final_label_plan:
+                lxp, lyp = final_label_plan[(key, i)][:2]
+                ax0, ay0 = job["ends"][i][0], job["ends"][i][1]
+                far_x = abs(lxp - ax0) > abs(tex - ax0) + 0.01
+                far_y = abs(lyp - ay0) > abs(tey - ay0) + 0.01
+                if (far_x and abs(ay0 - tex) < 0.01 and abs(ay0 - lyp) < 0.01) \
+                        or (far_y and abs(ax0 - tey) < 0.01 and abs(ax0 - lxp) < 0.01):
+                    tex, tey = lxp, lyp
             # stub 中途若有同网导线接入，收口到最靠引脚的接入点
             tap = _stub_early_tap(ax, ay, tex, tey, key)
             if tap is not None:

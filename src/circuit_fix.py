@@ -855,11 +855,43 @@ def _fix_led_gpio_no_resistor(items, ops, lib, fixes):
         k = next(iter(_p(led, lib, "K")), "1")
         a_net = ops.name(f"{led['ref']}:{a}")
         k_net = ops.name(f"{led['ref']}:{k}")
-        if not a_net or not k_net or not _GND_RE.search(k_net):
+        if not a_net or not k_net:
             continue
         members = ops.members(a_net)
         if not any(p.partition(":")[0] in mcu_refs for p in members):
             continue                      # 阳极网没有 MCU 驱动脚 → 不是 GPIO 直驱
+        # 阴极经电阻回 GND：电流确实被限制，但安全自检按「阳极串阻」口径
+        # 会一直报警。把同一颗电阻挪到阳极、阴极直接接地，不增加 BOM。
+        if not _GND_RE.search(k_net):
+            k_members = ops.members(k_net)
+            if len(k_members) == 2:
+                rp = next((p for p in k_members if p != f"{led['ref']}:{k}"), None)
+                if rp:
+                    ref, _, num = rp.partition(":")
+                    rit = by_ref.get(ref)
+                    other = f"{ref}:{'2' if num == '1' else '1'}"
+                    o_net = ops.name(other)
+                    if (rit and rit.get("symbol", "").lower().startswith("device:r")
+                            and o_net and _GND_RE.search(o_net)):
+                        led_net = f"LED_A_{led['ref']}"
+                        n = 2
+                        while any(net_name.get("name") == led_net for net_name in ops.nets):
+                            led_net = f"LED_A_{led['ref']}_{n}"
+                            n += 1
+                        ops.attach(f"{led['ref']}:{a}", led_net)
+                        ops.attach(rp, led_net)
+                        # 电阻的另一端必须回到原 GPIO 网，否则灯会脱离控制；
+                        # 阴极直接接到电阻原来占用的 GND 网。
+                        ops.attach(other, a_net)
+                        ops.attach(f"{led['ref']}:{k}", o_net)
+                        rit["name"] = "电阻（LED 限流）"
+                        rit["desc"] = "LED 限流电阻"
+                        fixes.append(
+                            f"LED {led['ref']} 的限流电阻原在阴极侧（{a_net}→LED→{ref}→GND），"
+                            f"已挪到阳极：{a_net}→{ref}→{led['ref']}→GND")
+                        continue
+        if not _GND_RE.search(k_net):
+            continue
         # 已有专属串联电阻：阳极网只有 LED 阳极 + 一个电阻 → 已正确，跳过
         if len(members) == 2 and any(
                 p.partition(":")[0] != led["ref"]
@@ -2002,6 +2034,55 @@ def _fix_usb(items, ops, lib, fixes):
     if xi_names and xo_names:
         xi, xo = next(iter(xi_names)), next(iter(xo_names))
         xi_net, xo_net = ops.name(f"{ur}:{xi}"), ops.name(f"{ur}:{xo}")
+        # LLM（或旧版规则反复补晶振）会把 XI/XO 并进同一条网，并把多颗晶振的
+        # 两脚都挂上去：每颗晶振被自己短接，振荡回路根本不存在。此时若按
+        # 「没有跨接两网的晶振」继续新增，只会一次次造出更多短路晶振。
+        # 先把 XI/XO 拆成两条网，保留一颗晶振跨接，删掉重复件，负载电容平分。
+        if xi_net and xi_net == xo_net:
+            short_net = xi_net
+            xtals = [it for it in items
+                     if "crystal" in str(it.get("symbol", "")).lower()
+                     and ops.name(f"{it['ref']}:1") == short_net
+                     and ops.name(f"{it['ref']}:2") == short_net]
+            keep = next((x for x in xtals if "12m" in str(x.get("value", "")).lower()),
+                        xtals[0] if xtals else None)
+            dup = [x for x in xtals if x is not keep]
+            for x in dup:
+                ops.remove_component(x["ref"], [f"{x['ref']}:1", f"{x['ref']}:2"])
+            items[:] = [x for x in items if x not in dup]
+            if dup:
+                fixes.append("删除重复且两脚短路的晶振 "
+                             + "、".join(x["ref"] for x in dup))
+            taken = {net["name"] for net in ops.nets}
+            xi_new, xo_new = f"{short_net}_XI", f"{short_net}_XO"
+            for suffix in ("_2", "_3", "_4", "_5"):
+                if xi_new not in taken:
+                    break
+                xi_new = f"{short_net}_XI{suffix}"
+            for suffix in ("_2", "_3", "_4", "_5"):
+                if xo_new not in taken:
+                    break
+                xo_new = f"{short_net}_XO{suffix}"
+            ops.attach(f"{ur}:{xi}", xi_new)
+            ops.attach(f"{ur}:{xo}", xo_new)
+            if keep is not None:
+                ops.attach(f"{keep['ref']}:1", xi_new)
+                ops.attach(f"{keep['ref']}:2", xo_new)
+            caps = [it for it in items
+                    if str(it.get("symbol", "")).lower().startswith("device:c")
+                    and "pf" in str(it.get("value", "")).lower()
+                    and (ops.name(f"{it['ref']}:1") == short_net
+                         or ops.name(f"{it['ref']}:2") == short_net)]
+            for i, cap in enumerate(caps):
+                target = xi_new if i % 2 == 0 else xo_new
+                for p in ("1", "2"):
+                    if ops.name(f"{cap['ref']}:{p}") == short_net:
+                        ops.attach(f"{cap['ref']}:{p}", target)
+            fixes.append(
+                f"{ur} 的 XI/XO 原被并在同一网 {short_net}（晶振两脚短路、不起振），"
+                f"已拆为 {xi_new}/{xo_new}"
+                + (f"，保留 {keep['ref']} 跨接" if keep else "，等待补晶振"))
+            xi_net, xo_net = xi_new, xo_new
         has_xtal = False
         if xi_net and xo_net and xi_net != xo_net:
             for it in items:
@@ -2481,6 +2562,46 @@ def _drop_stale_migration_fixes(ops, fixes: list[str]) -> None:
     fixes[:] = keep
 
 
+def _fix_isolated_switch_pins(items, ops, fixes: list[str]) -> None:
+    """补全「只有一侧接进电路」的轻触按键：另一侧归位 GND。
+
+    LLM 有时只把复位键一侧接到 NRST，另一侧留在 `SW1:2` 这种单脚网；
+    ERC 不报（引脚"已连接"），视觉看着也有线，但按键按下不会拉低 NRST，
+    复位电路实际失效。判据严格：
+      - 轻触按键（Switch:SW_Push 系列）恰好只有一侧出现在网表；
+      - 已接的那一侧含真实活跃芯片脚（MCU/接口/连接器），不是空网；
+      - 另一侧悬空或落在只有自己的孤立网，且不是电源/GND。
+    修法：把另一侧接到现有 GND，形成「信号→按键→GND」。
+    """
+    gnd = _gnd_net(ops)
+    for it in items:
+        sym = str(it.get("symbol", "")).lower()
+        if not (sym.startswith("switch:") and "push" in sym):
+            continue
+        ref = it["ref"]
+        attached, isolated = [], []
+        for num in ("1", "2"):
+            name = ops.name(f"{ref}:{num}")
+            # 「只有自己一脚」的网名等同悬空：按键这一侧并没有接到任何器件
+            (isolated if not name or len(ops.members(name)) <= 1
+             else attached).append((num, name))
+        if len(attached) != 1 or len(isolated) != 1:
+            continue
+        num, net = attached[0]
+        other, other_net = isolated[0]
+        if _GND_RE.search(net) or _SUPPLY_RE.match(net):
+            continue
+        if not _has_active_chip(ops, net, items):
+            continue
+        if other_net and (_GND_RE.search(other_net) or _SUPPLY_RE.match(other_net)):
+            continue
+        ops.attach(f"{ref}:{other}", gnd)
+        fixes.append(
+            f"{ref} 的 {other} 脚原"
+            f"{'悬空' if not other_net else '在孤立网 ' + other_net}，"
+            f"已接到 GND，形成 {net}→{ref}→GND（按键按下才真正拉低信号）")
+
+
 def _fix_reset_pullup(items, ops, lib, fixes: list[str]) -> None:
     """把 NRST 网上的复位电阻从 GND 改到 3.3V，复位按键保持接 GND。"""
     for it in items:
@@ -2808,11 +2929,16 @@ def _drop_dead_end_passives(items, ops, fixes: list[str]) -> None:
                 continue
             reason = f"另一脚悬空"
         elif n1 and n2 and n1 != n2:
-            # 情形二：一端接 GND/电源、另一端接在「只有它自己」的孤立网
-            # （LLM 把限流电阻接成 "R→孤立LED网" 的死支路，ERC/功能自检曾漏过）
+            # 情形二：一端接 GND/电源/GPIO、另一端接在「只有它自己」的孤立网
+            # （LLM 把限流电阻接成 "GPIO→R→孤立LED网" 的死支路，但 BOM 里
+            #  并没有第二颗 LED；ERC/视觉都看不出，只有功能自检报孤立脚。
+            #  所有修复 LED 的规则都已在前面试过，这里剩下的就是无用件。）
             for fixed_pin, fixed_net, lone_pin, lone_net in (
                     (p1, n1, p2, n2), (p2, n2, p1, n1)):
-                if not (_GND_RE.search(fixed_net) or _SUPPLY_RE.match(fixed_net)):
+                driven = (_GND_RE.search(fixed_net)
+                          or _SUPPLY_RE.match(fixed_net)
+                          or _has_active_chip(ops, fixed_net, items))
+                if not driven:
                     continue
                 if len(members.get(lone_net, ())) == 1 and lone_pin in members[lone_net]:
                     dead_pin = lone_pin
@@ -3158,6 +3284,7 @@ def fix_topology(bom: dict, netlist: dict, symbol_lib=None) -> list[str]:
     _fix_regulator_input(items, ops, symbol_lib, fixes)  # 稳压器 VI 悬空→补输入电源网/接口
     _fix_power_input_connector(items, ops, symbol_lib, fixes)  # 标注 5V 的输入口误接 3.3V 网→回到稳压器输入
     _fix_dangling_chip_power(items, ops, symbol_lib, fixes)  # VDD/VBAT/VDDA 悬空或单脚网→并到 3.3V
+    _fix_isolated_switch_pins(items, ops, fixes)  # 按键只有一侧接线→另一侧归 GND
     _fix_reset_pullup(items, ops, symbol_lib, fixes)
     _fix_led(items, ops, symbol_lib, fixes)
     _fix_mcu_pins(items, ops, symbol_lib, fixes)

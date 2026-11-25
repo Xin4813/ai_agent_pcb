@@ -236,13 +236,13 @@ def check_functional(bom: dict, netlist: dict, symbol_lib=None) -> dict:
                 issues.append(f"{p} 同时出现在 {seen[key]} 与 {net['name']}")
             seen[key] = net["name"]
 
-    # 2) 无源器件（R/C/LED/晶振/电感）每个脚都必须接网——但排除 NC 脚。
+    # 2) 无源器件（R/C/LED/晶振/电感/轻触按键）每个脚都必须接网——但排除 NC 脚。
     #    连接器不算：排针/USB 的针脚按设计本就可悬空（如 USB ID、闲置 GPIO）。
     for it in items:
         sym = it.get("symbol", "").lower()
         # 精确前缀，避免 Interface_USB:CH340G / Regulator_Linear 被 ":c"/":l" 误匹配
         if not sym.startswith(("device:r", "device:c", "device:led",
-                               "device:crystal", "device:l")):
+                               "device:crystal", "device:l", "switch:sw_push")):
             continue
         if symbol_lib:
             try:
