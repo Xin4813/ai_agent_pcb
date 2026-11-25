@@ -400,6 +400,42 @@ def check_functional(bom: dict, netlist: dict, symbol_lib=None) -> dict:
                     f"应把 {r} 该端接到对应 GPIO")
                 checked += 1
 
+    # 6a2) 「GPIO 被上拉电阻拉到电源」导致 LED 常亮、程序关不断。
+    #      形态：LED 阳极→限流电阻→GPIO 网，但该 GPIO 网同时经另一颗电阻上拉到
+    #      电源。电流绕开 GPIO 常通，ERC/safety 都看不到（上拉电阻本身合法）。
+    for it, a, k, an, kn in leds:
+        if not an:
+            continue
+        a_res = [(r, num) for r, num in net_pins.get(an, ()) if is_res(r)]
+        if len(a_res) != 1 or len(net_pins.get(an, ())) != 2:
+            continue
+        r, num = a_res[0]
+        other = "2" if num == "1" else "1"
+        gpio_net = pin_net.get((r, other))
+        if not gpio_net or _SUPPLY_RE.match(gpio_net) or _GND_RE.search(gpio_net):
+            continue
+        gm = net_pins.get(gpio_net, ())
+        # GPIO 网须含非无源器件脚（确认是真 GPIO，不是纯电阻串）
+        active = any(
+            (lambda s: s and not s.startswith(("device:r", "device:c", "device:l",
+                                                "device:led", "device:crystal")))(
+                by_ref.get(rr, {}).get("symbol", "").lower())
+            for rr, _ in gm)
+        if not active:
+            continue
+        for rr, rn in gm:
+            if not is_res(rr) or (rr, rn) == (r, other):
+                continue
+            oo = "2" if rn == "1" else "1"
+            on = pin_net.get((rr, oo))
+            if on and _SUPPLY_RE.match(on):
+                issues.append(
+                    f"LED {it['ref']} 阳极经 {r} 回 GPIO 网 {gpio_net}，"
+                    f"但该网被 {rr} 上拉到 {on}——LED 常亮、GPIO 关不断；"
+                    f"应删除上拉电阻 {rr}")
+                checked += 1
+                break
+
     # 6b) 网表功能覆盖：ERC 看不出、但功能上一定错的漏接。
     #     - 单脚网络（ICSP 只写排针端、AREF 悬空）
     #     - 芯片整组 IO 全未接（如 Arduino 的 A0-A5/PC0-PC5 整组丢失），

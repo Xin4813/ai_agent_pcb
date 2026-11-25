@@ -1202,6 +1202,82 @@ def _fix_led_cathode_resistor_to_gpio(items, ops, lib, fixes: list[str]) -> None
             f"已将 {ref} 串到阳极、阴极接地：GPIO({a_net})→{ref}→{led['ref']}→GND")
 
 
+def _fix_led_gpio_pullup_always_on(items, ops, lib, fixes: list[str]) -> None:
+    """修复「LED 阳极经限流电阻到 GPIO，但该 GPIO 又被上拉电阻接到电源」。
+
+    变体（ERC/视觉/safety/功能全绿，实际灯常亮且 GPIO 拉不下来）：
+      3V3 ─R2─ ┬─ U1:2(PC13 GPIO)
+                └─ R3 ─ LED_A ─ LED 阳极 ─ LED 阴极 ─ GND
+    R2 把 GPIO 永久拉高，LED 始终有电流，程序无法关灯。
+    通用修法（按拓扑不按位号/网名）：删除那颗把 GPIO 网拉到电源的电阻，
+    保留 GPIO→R3→LED→GND。只在该网同时含 MCU GPIO 与 LED 限流电阻时动手。
+    """
+    by_ref = {it["ref"]: it for it in items}
+    mcu_refs = {it["ref"] for it in items if _is_mcu_item(it)}
+    if not mcu_refs:
+        return
+    gnd = _gnd_net(ops)
+
+    def is_res(pin: str) -> bool:
+        ref = pin.partition(":")[0]
+        return by_ref.get(ref, {}).get("symbol", "").lower().startswith("device:r")
+
+    def res_other(pin: str) -> str | None:
+        ref, _, num = pin.partition(":")
+        other = f"{ref}:{'2' if num == '1' else '1'}"
+        return other if is_res(other) else None
+
+    for led in [it for it in items
+                if it.get("symbol", "").lower().endswith(":led")]:
+        a = next(iter(_p(led, lib, "A")), "2")
+        k = next(iter(_p(led, lib, "K")), "1")
+        a_net, k_net = ops.name(f"{led['ref']}:{a}"), ops.name(f"{led['ref']}:{k}")
+        if not k_net or not _GND_RE.search(k_net):
+            continue
+        if not a_net:
+            continue
+        # LED 阳极网须恰好有一个电阻端（限流电阻 R_led 的 LED 侧）
+        a_members = ops.members(a_net)
+        led_res_pins = [p for p in a_members if is_res(p)]
+        if len(led_res_pins) != 1 or len(a_members) != 2:
+            continue
+        r_led_pin = led_res_pins[0]
+        gpio_side = res_other(r_led_pin)      # R_led 的另一端
+        if not gpio_side:
+            continue
+        gpio_net = ops.name(gpio_side)
+        if not gpio_net or _SUPPLY_RE.match(gpio_net) or _GND_RE.search(gpio_net):
+            continue
+        gm = ops.members(gpio_net)
+        # GPIO 网必须含 MCU 脚，且有且仅有另一颗电阻把它上拉到电源
+        if not any(p.partition(":")[0] in mcu_refs for p in gm):
+            continue
+        pull = None
+        for p in gm:
+            if not is_res(p) or p == gpio_side:
+                continue
+            other = res_other(p)
+            if not other:
+                continue
+            on = ops.name(other)
+            if on and _SUPPLY_RE.match(on):
+                pull = (p.partition(":")[0], p, other)
+                break
+        if not pull:
+            continue
+        # 删除上拉电阻（两端都从网表摘除，避免残留单脚网/悬空件）
+        ref, p1, p2 = pull
+        ops.remove_component(ref, [p1, p2])
+        items[:] = [x for x in items if x.get("ref") != ref]
+        # LED 描述同步为受控状态灯，避免 BOM 仍写「电源指示灯」
+        if "电源" in str(led.get("desc", "")) and "指示" in str(led.get("desc", "")):
+            led["desc"] = "状态指示灯（GPIO 控制）"
+        fixes.append(
+            f"LED {led['ref']} 原经 {r_led_pin.partition(':')[0]} 回 GPIO、"
+            f"但 GPIO 被 {ref} 上拉到电源而常亮；已删除上拉电阻 {ref}，"
+            f"恢复 GPIO→{r_led_pin.partition(':')[0]}→{led['ref']}→GND（可由程序关断）")
+
+
 def _fix_led(items, ops, lib, fixes):
     """逐个 LED 检查：阳极若直接跨电源则补串联限流电阻。"""
     leds = [it for it in items if "led" in
@@ -1214,6 +1290,7 @@ def _fix_led(items, ops, lib, fixes):
     _fix_mislabeled_led_resistor(items, ops, lib, fixes)
     _fix_led_gpio_no_resistor(items, ops, lib, fixes)
     _fix_led_cathode_resistor_to_gpio(items, ops, lib, fixes)
+    _fix_led_gpio_pullup_always_on(items, ops, lib, fixes)
     _fix_floating_led_gpio(items, ops, lib, fixes)
     _fix_led_dead_loop(items, ops, lib, fixes)
 

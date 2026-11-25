@@ -1419,6 +1419,47 @@ def write_schematic(netlist: dict, bom: dict, output_path, symbols_dir,
                     cost += 1
         return cost
 
+    def _seg_hits_rect(x1, y1, x2, y2, rect, inset=0.35, tol=0.01):
+        """与 visual_check.seg_hits_rect 同口径：导线是否穿进矩形内部。"""
+        ix0, iy0, ix1, iy1 = rect[0] + inset, rect[1] + inset, \
+                             rect[2] - inset, rect[3] - inset
+        if ix0 >= ix1 or iy0 >= iy1:
+            ix0, iy0, ix1, iy1 = rect
+        if ix0 < x1 < ix1 and iy0 < y1 < iy1:
+            return True
+        if ix0 < x2 < ix1 and iy0 < y2 < iy1:
+            return True
+        if abs(y1 - y2) < tol:
+            return (iy0 < y1 < iy1
+                    and max(x1, x2) > ix0 + tol and min(x1, x2) < ix1 - tol)
+        if abs(x1 - x2) < tol:
+            return (ix0 < x1 < ix1
+                    and max(y1, y2) > iy0 + tol and min(y1, y2) < iy1 - tol)
+        return False
+
+    def _line_contact_cost():
+        """标签文字被**异网**导线穿过的数量（视觉 info，非错误）。
+
+        作为标签候选的次要排序目标：只在文字重叠数相同的候选之间挑更少
+        邻线接触的位置，绝不为了消 info 牺牲 0 重叠。锚点仍受本网导线约束，
+        不改电气、不串网。引脚引出线此时尚未进 wire_buffer，故只能减少、
+        不保证完全归零。
+        """
+        cost = 0
+        for lab in label_items:
+            bb = _label_box(lab)
+            key = lab["key"][0]
+            for x1, y1, x2, y2, k in wire_buffer:
+                if k == key:        # 本网导线是标签宿主，不算邻线
+                    continue
+                if _seg_hits_rect(x1, y1, x2, y2, bb):
+                    cost += 1
+                    break
+        return cost
+
+    def _score():
+        return (_total_clash(), _line_contact_cost())
+
     def _apply(lab, cand):
         lab["cell"], lab["angle"] = cand
         lab["x"], lab["y"] = _from_grid(*cand[0])
@@ -1427,11 +1468,11 @@ def write_schematic(netlist: dict, bom: dict, output_path, symbols_dir,
         for _pass in range(6):
             changed = False
             for lab in label_items:
-                before = _total_clash()
+                before = _score()
                 best = ((lab["cell"], lab["angle"]), before)
                 for cand in lab["cands"]:
                     _apply(lab, cand)
-                    cost = _total_clash()
+                    cost = _score()
                     if cost < best[1]:
                         best = (cand, cost)
                 _apply(lab, best[0])
