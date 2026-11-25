@@ -484,4 +484,31 @@ def check_functional(bom: dict, netlist: dict, symbol_lib=None) -> dict:
     except Exception:
         pass
 
+    # 6f) UART 的 TXD/RXD 整对漏接：LLM 常把 TXD/RXD 完全丢在网表外，
+    #     MCU 侧 TX/RX 各自成为单脚网名；ERC/视觉/safety 全绿，
+    #     但 USB 转串口一条线都不通。修复规则会补连，这里只做只读自检。
+    try:
+        from .circuit_fix import _looks_uart_symbol, _p
+        for uart in items:
+            if not _looks_uart_symbol(uart, symbol_lib):
+                continue
+            for u_role, pins in (("TXD", _p(uart, symbol_lib, "TXD")
+                                  or _p(uart, symbol_lib, "TX")),
+                                 ("RXD", _p(uart, symbol_lib, "RXD")
+                                  or _p(uart, symbol_lib, "RX"))):
+                if not pins:
+                    continue
+                num = next(iter(pins))
+                net = pin_net.get((uart["ref"], num))
+                if net and len(net_pins.get(net, ())) > 1:
+                    continue                     # 已真正接到 MCU/其它脚
+                m_role = "RX" if u_role == "TXD" else "TX"
+                issues.append(
+                    f"{uart['ref']} 的 {u_role}({uart['ref']}:{num}) "
+                    f"{'悬空' if not net else '只在单脚网 ' + net}，"
+                    f"未接到 MCU 的 USART_{m_role} 脚——USB 转串口不通")
+                checked += 1
+    except Exception:
+        pass
+
     return {"ok": not issues, "issues": issues, "checked": checked}

@@ -66,6 +66,15 @@ class _Nets:
         return set()
 
     def ensure(self, name: str):
+        # LLM 或某些修复分支可能传入 None/空网名；统一在这里兜底，
+        # 避免后续 re.search / .lower() 收到 None 抛 TypeError。
+        if not isinstance(name, str) or not name.strip():
+            taken = {n.get("name") for n in self.nets}
+            i = 1
+            name = f"NET_{i}"
+            while name in taken:
+                i += 1
+                name = f"NET_{i}"
         for net in self.nets:
             if net["name"] == name:
                 return net
@@ -373,6 +382,53 @@ def _fix_power(items, ops, lib, fixes):
         fixes.append(f"{pin}（{name}）从 {old} 迁到 {v33}")
 
     fixes.append(f"把 {', '.join(chip_refs)} 的 {'/'.join(moved_names)} 从 {old} 迁到 {v33}")
+
+
+def _fix_dangling_chip_power(items, ops, lib, fixes: list[str]) -> None:
+    """3.3V 芯片的 VDD/VBAT/VDDA 若悬空或只挂在自己的单脚网，并到 3.3V 电源。
+
+    `_fix_power` 只处理「原本接在 5V 热网」的供电脚；LLM 也会把某个 VDD
+    脚整脚漏掉（如 STM32 的 VDD36），ERC 视悬空电源输入为警告/不报，
+    safety 只看位号不看每个电源脚，功能自检能抓到但此前没有修复动作。
+    """
+    rail = None
+    for it in items:
+        v = _regulator_output(it)
+        if v is None or abs(v - 3.3) >= 0.2:
+            continue
+        vo = next(iter(_p(it, lib, "VO") or _p(it, lib, "VOUT") or ["2"]))
+        nn = ops.name(f"{it['ref']}:{vo}")
+        if nn:
+            rail = nn
+            break
+    if not rail:
+        for it in items:
+            need = _chip_vcc(it)
+            if need is None or need > 3.6:
+                continue
+            for p in _p(it, lib, "VDD"):
+                nn = ops.name(f"{it['ref']}:{p}")
+                if nn and len(ops.members(nn)) > 1:
+                    rail = nn
+                    break
+            if rail:
+                break
+    if not rail:
+        return
+    for it in items:
+        need = _chip_vcc(it)
+        if need is None or need > 3.6:
+            continue
+        for name in ("VDD", "VBAT", "VDDA"):
+            for p in _p(it, lib, name):
+                pin = f"{it['ref']}:{p}"
+                net = ops.name(pin)
+                if net and len(ops.members(net)) > 1:
+                    continue                   # 已有真实供电/滤波网络
+                ops.attach(pin, rail)
+                fixes.append(
+                    f"{it['ref']} 的 {name} 脚 {pin} 原"
+                    f"{'悬空' if not net else '仅单脚网 ' + net}，已接到 3.3V 网 {rail}")
 
 
 def _is_gpio_net(ops, name, items) -> bool:
@@ -890,6 +946,59 @@ def _fix_reversed_led(items, ops, lib, fixes):
             f"已对调：电源→R→{led['ref']} 阳极→阴极→GND")
 
 
+def _fix_led_cathode_resistor_to_gpio(items, ops, lib, fixes: list[str]) -> None:
+    """LED 阳极直挂 GPIO、阴极经电阻回到**另一个 GPIO**时，把电阻挪到阳极侧。
+
+    LLM 有时画出 PB0→LED→R→PC13：阴极那颗电阻虽然限流，但两端都是 IO，
+    不是电源/地回路，安全自检会报「阳极直接挂在 GPIO 上、没有限流电阻」。
+    通用修法：复用这颗电阻串到阳极，阴极直接接地，原另一个 GPIO 释放。
+    """
+    by_ref = {it["ref"]: it for it in items}
+    mcu_refs = {it["ref"] for it in items if _is_mcu_item(it)}
+    if not mcu_refs:
+        return
+    gnd = _gnd_net(ops)
+    for led in [it for it in items
+                if "led" in f"{it.get('value', '')} {it.get('symbol', '')}".lower()
+                and it.get("symbol", "").lower().endswith(":led")]:
+        a = next(iter(_p(led, lib, "A")), "2")
+        k = next(iter(_p(led, lib, "K")), "1")
+        a_pin, k_pin = f"{led['ref']}:{a}", f"{led['ref']}:{k}"
+        a_net, k_net = ops.name(a_pin), ops.name(k_pin)
+        if not a_net or not k_net or _GND_RE.search(k_net) or _SUPPLY_RE.match(k_net):
+            continue
+        if not any(p.partition(":")[0] in mcu_refs for p in ops.members(a_net)):
+            continue                     # 阳极不是 GPIO 驱动
+        k_members = ops.members(k_net)
+        if len(k_members) != 2:
+            continue
+        rp = next((p for p in k_members if p != k_pin), None)
+        if not rp:
+            continue
+        ref, _, num = rp.partition(":")
+        rit = by_ref.get(ref)
+        if not rit or not rit.get("symbol", "").lower().startswith("device:r"):
+            continue
+        other = f"{ref}:{'2' if num == '1' else '1'}"
+        o_net = ops.name(other)
+        if (not o_net or _GND_RE.search(o_net) or _SUPPLY_RE.match(o_net)
+                or not any(p.partition(":")[0] in mcu_refs
+                           for p in ops.members(o_net))):
+            continue
+        new_net = f"LED_A_{led['ref']}"
+        k = 2
+        while any(n.get("name") == new_net for n in ops.nets):
+            new_net = f"LED_A_{led['ref']}_{k}"
+            k += 1
+        ops.attach(a_pin, new_net)
+        ops.attach(rp, new_net)
+        ops.attach(other, a_net)
+        ops.attach(k_pin, gnd)
+        fixes.append(
+            f"LED {led['ref']} 原为 GPIO({a_net})→LED→{ref}→GPIO({o_net})；"
+            f"已将 {ref} 串到阳极、阴极接地：GPIO({a_net})→{ref}→{led['ref']}→GND")
+
+
 def _fix_led(items, ops, lib, fixes):
     """逐个 LED 检查：阳极若直接跨电源则补串联限流电阻。"""
     leds = [it for it in items if "led" in
@@ -901,6 +1010,7 @@ def _fix_led(items, ops, lib, fixes):
     _fix_led_cross_resistor(items, ops, lib, fixes)
     _fix_mislabeled_led_resistor(items, ops, lib, fixes)
     _fix_led_gpio_no_resistor(items, ops, lib, fixes)
+    _fix_led_cathode_resistor_to_gpio(items, ops, lib, fixes)
     _fix_floating_led_gpio(items, ops, lib, fixes)
     _fix_led_dead_loop(items, ops, lib, fixes)
 
@@ -1088,10 +1198,13 @@ def _fix_one_led(led, items, ops, lib, fixes):
     anode = ops.members(a_net)
     by_ref = {it["ref"]: it for it in items}
     # 电源网里已有专属限流电阻（该网只有 LED 和一个电阻）→ 已正确
+    # ops.members() 返回的是 {"R1:1", "LED1:2"} 这样的**引脚字符串集合**，
+    # 不是 (ref, num) 元组。旧版 `for r, _n in anode` 会把字符串当序列解包，
+    # 遇到 "R3:2" 这种 4 字符脚名就抛 ValueError: too many values to unpack。
     if (len(anode) == 2 and any(
-            r != led["ref"]
-            and by_ref.get(r, {}).get("symbol", "").lower().startswith("device:r")
-            for r, _n in anode)):
+            p.partition(":")[0] != led["ref"]
+            and by_ref.get(p.partition(":")[0], {}).get("symbol", "").lower().startswith("device:r")
+            for p in anode)):
         return
 
     # 找可作限流的电阻。两类候选（优先级从高到低）：
@@ -1423,6 +1536,40 @@ def _split_shared_crystal(items, ops, lib, fixes) -> None:
         f"已将 MCU 时钟与负载电容迁到悬空的 {slow['ref']}({slow.get('value','')})")
 
 
+def _is_zero_ohm(item) -> bool:
+    """是否 0Ω 电阻/跳线（用于两个电源输出等电位连接且避免 ERC 冲突）。"""
+    val = str(item.get("value", "")).strip().lower().replace(" ", "")
+    return bool(re.fullmatch(r"0(?:r|ohms?|Ω)?", val, re.I))
+
+
+def _net_voltage_class(items, ops, lib, net_name: str) -> str:
+    """判断网络的供电档位：3v3 / 5v / unknown（unknown 时保守不动 V3）。"""
+    if not net_name:
+        return "unknown"
+    if _V33_NAME_RE.search(net_name) or re.search(r"\bvdd(?:33)?\b", net_name, re.I):
+        return "3v3"
+    if re.search(r"(?:\b5v\b|\+5\b|vbus|usb5)", net_name, re.I):
+        return "5v"
+    by_ref = {it["ref"]: it for it in items}
+    for pin in ops.members(net_name):
+        ref, _, num = pin.partition(":")
+        it = by_ref.get(ref)
+        if not it:
+            continue
+        v = _regulator_output(it)
+        if v is not None:
+            vo = next(iter(_p(it, lib, "VO") or _p(it, lib, "VOUT") or ["2"]))
+            if num == vo:
+                if abs(v - 3.3) < 0.2:
+                    return "3v3"
+                if abs(v - 5.0) < 0.5:
+                    return "5v"
+        if _is_mcu_item(it) and any(num in _p(it, lib, n)
+                                    for n in ("VDD", "VDDA", "VBAT")):
+            return "3v3"
+    return "unknown"
+
+
 def _fix_usb(items, ops, lib, fixes):
     """CH340G + Micro-USB 时修正 D+/D− 连接、XI/XO 晶振与负载电容。
 
@@ -1438,7 +1585,9 @@ def _fix_usb(items, ops, lib, fixes):
     if not usb:
         # 没有 USB 口也没有 5V 来源时不硬造电源；但仍需给 UART 补晶振，
         # 否则即使后来外接串口线也无法工作。
-        fixes.append(f"{uart['ref']} 未找到 USB 5V 来源，跳过 D+/D− 修正")
+        # 注意：这是「未做」的说明而非拓扑修正，不能写进 fixes，
+        # 否则 fix_topology 永不幂等，全量审计每次都会误报一个待修项。
+        pass
     by_ref = {it["ref"]: it for it in items}
     ur = uart["ref"]
     gnd = _gnd_net(ops)
@@ -1540,33 +1689,110 @@ def _fix_usb(items, ops, lib, fixes):
                     ops.attach(f"{it['ref']}:{other}", gnd)
                     fixes.append(f"{it['ref']}（{it.get('value','')}）从 {cur or '悬空'} 改接 GND，作为 XI/XO 负载电容")
 
-    # ④ CH340G 的 V3 退耦：内部 3.3V 输出需要 100nF 到 GND（即使悬空也要补，
-    #    不能把 V3 输出直接并到板上 3.3V 电源网，否则两个电源输出相冲）。
-    v3p = next(iter(_p(uart, lib, "V3")), "4")
-    v3_pin = f"{ur}:{v3p}"
-    v3_net = ops.name(v3_pin)
-    if not v3_net:
-        v3_net = f"{ur}_V3"
-        ops.attach(v3_pin, v3_net)
-        fixes.append(f"为 {ur} 的 V3 建立独立退耦网 {v3_net}")
-    has_v3_cap = False
+    # ④ UART 的 VCC / V3 供电处理（CH340G 数据手册）：
+    #    VCC=5V（VBUS）时 V3 是内部 3.3V LDO 的旁路点 → 独立 100nF 到 GND；
+    #    VCC=3.3V 时 V3 必须与 VCC 短接，悬空只挂电容会导致串口不工作。
+    vcc_pins = _p(uart, lib, "VCC")
+    logic_vdd = None
     for it in items:
-        sym = it.get("symbol", "").lower()
-        val = str(it.get("value", "")).lower()
-        if not (sym.endswith(":c") or "cap" in sym or "电容" in str(it.get("name", ""))):
-            continue
-        if "n" not in val and "u" not in val:
-            continue
-        for p, other in (("1", "2"), ("2", "1")):
-            if ops.name(f"{it['ref']}:{p}") == v3_net and ops.name(f"{it['ref']}:{other}") == gnd:
-                has_v3_cap = True
-    if not has_v3_cap:
-        ref = _add_ref(items, "C")
-        items.append({"ref": ref, "name": "电容（V3 退耦）", "value": "100nF",
-                      "qty": 1, "symbol": "Device:C", "footprint": ""})
-        ops.attach(f"{ref}:1", v3_net)
-        ops.attach(f"{ref}:2", gnd)
-        fixes.append(f"新增 {ref}（100nF）为 {ur} 的 V3 退耦")
+        if (v := _regulator_output(it)) is not None and abs(v - 3.3) < 0.2:
+            vo = _p(it, lib, "VO") or _p(it, lib, "VOUT") or ["2"]
+            logic_vdd = ops.name(f"{it['ref']}:{vo[0]}")
+            if logic_vdd:
+                break
+    if not logic_vdd:
+        for it in items:
+            if not _is_mcu_item(it):
+                continue
+            for vp in _p(it, lib, "VDD"):
+                nn = ops.name(f"{it['ref']}:{vp}")
+                if nn:
+                    logic_vdd = nn
+                    break
+            if logic_vdd:
+                break
+    vcc_pin = f"{ur}:{vcc_pins[0]}" if vcc_pins else None
+    vcc_net = (ops.name(vcc_pin) if vcc_pin else None) or logic_vdd
+    vcc_class = _net_voltage_class(items, ops, lib, vcc_net)
+
+    v3p = next(iter(_p(uart, lib, "V3")), None)
+    if v3p:
+        v3_pin = f"{ur}:{v3p}"
+        v3_net = ops.name(v3_pin)
+        if vcc_class == "3v3" and vcc_net:
+            bridged = False
+            for it in items:
+                if (not it.get("symbol", "").lower().startswith("device:r")
+                        or not _is_zero_ohm(it)):
+                    continue
+                if {ops.name(f"{it['ref']}:1"),
+                    ops.name(f"{it['ref']}:2")} == {v3_net, vcc_net}:
+                    bridged = True
+                    break
+            if not bridged:
+                if not v3_net:
+                    # V3 脚整脚漏在网表外时，0Ω 电阻的一端不能悬空：
+                    # 先建独立 V3 网并把芯片脚放进去，再用 0Ω 接 VCC。
+                    v3_net = f"{ur}_V3"
+                    k = 2
+                    while any(n.get("name") == v3_net for n in ops.nets):
+                        v3_net = f"{ur}_V3_{k}"
+                        k += 1
+                    ops.attach(v3_pin, v3_net)
+                    fixes.append(f"{ur} 的 V3 脚原悬空，已建立独立网 {v3_net}")
+                rref = _add_ref(items, "R")
+                items.append({"ref": rref, "name": "电阻（V3-VCC 0Ω 等电位）",
+                              "value": "0Ω", "qty": 1,
+                              "symbol": "Device:R", "footprint": ""})
+                if v3_net == vcc_net:
+                    # 旧版直接并到 VCC（ERC 会报两个电源输出冲突）：
+                    # 新建独立 V3 网，把 V3 及其退耦电容迁回，再用 0Ω 连接。
+                    base = f"{ur}_V3"
+                    v3_net = base
+                    k = 2
+                    while ops.members(v3_net):
+                        v3_net = f"{base}_{k}"
+                        k += 1
+                    ops.attach(v3_pin, v3_net)
+                    for p in list(ops.members(vcc_net)):
+                        if p == v3_pin:
+                            continue
+                        pref = p.partition(":")[0]
+                        pit = next((x for x in items if x.get("ref") == pref), None)
+                        if pit and ("v3" in f"{pit.get('name', '')} {pit.get('desc', '')}".lower()
+                                    and ("device:c" in pit.get("symbol", "").lower()
+                                         or "cap" in pit.get("symbol", "").lower())):
+                            ops.attach(p, v3_net)
+                ops.attach(f"{rref}:1", v3_net)
+                ops.attach(f"{rref}:2", vcc_net)
+                fixes.append(
+                    f"{ur} 的 V3 在 3.3V 供电时必须与 VCC 等电位；"
+                    f"已通过 0Ω 电阻 {rref} 连接（避免两个电源输出直接相冲）")
+        else:
+            if not v3_net:
+                v3_net = f"{ur}_V3"
+                ops.attach(v3_pin, v3_net)
+                fixes.append(f"为 {ur} 的 V3 建立独立退耦网 {v3_net}")
+            has_v3_cap = False
+            for it in items:
+                sym = it.get("symbol", "").lower()
+                val = str(it.get("value", "")).lower()
+                if not (sym.endswith(":c") or "cap" in sym
+                        or "电容" in str(it.get("name", ""))):
+                    continue
+                if "n" not in val and "u" not in val:
+                    continue
+                for p, other in (("1", "2"), ("2", "1")):
+                    if (ops.name(f"{it['ref']}:{p}") == v3_net
+                            and ops.name(f"{it['ref']}:{other}") == gnd):
+                        has_v3_cap = True
+            if not has_v3_cap:
+                ref = _add_ref(items, "C")
+                items.append({"ref": ref, "name": "电容（V3 退耦）", "value": "100nF",
+                              "qty": 1, "symbol": "Device:C", "footprint": ""})
+                ops.attach(f"{ref}:1", v3_net)
+                ops.attach(f"{ref}:2", gnd)
+                fixes.append(f"新增 {ref}（100nF）为 {ur} 的 V3 退耦")
 
     # ⑤ UART 的 GND 脚必须真接到 GND 网。LLM 常把 TXD/RXD/D±/晶振都接对，
     #    却漏掉 GND（悬空），芯片无参考地、整条 USB 转串口不工作；ERC 视
@@ -1589,29 +1815,8 @@ def _fix_usb(items, ops, lib, fixes):
     #    芯片无供电、USB 转串口完全不工作；ERC/视觉/safety 全绿（悬空输入合法、
     #    safety 旧版只查 MCU/稳压器供电脚）。逻辑电源优先取 3.3V 稳压器输出网，
     #    其次取 MCU 的 VDD 网；找不到就不硬造，避免接到 5V/VBUS。
-    vcc_pins = _p(uart, lib, "VCC")
-    if not vcc_pins:
-        # 查不到符号里的 VCC 脚就跳过，绝不硬编码 pin 号：
-        # CH340G 的 VCC=16，但 CP2102 的 16 脚是 WAKEUP/GPIO.3，硬编码会接错。
-        vcc_pins = []
-    logic_vdd = None
-    for it in items:
-        if (v := _regulator_output(it)) is not None and abs(v - 3.3) < 0.2:
-            vo = _p(it, lib, "VO") or _p(it, lib, "VOUT") or ["2"]
-            logic_vdd = ops.name(f"{it['ref']}:{vo[0]}")
-            if logic_vdd:
-                break
-    if not logic_vdd:
-        for it in items:
-            if not _is_mcu_item(it):
-                continue
-            for vp in _p(it, lib, "VDD"):
-                nn = ops.name(f"{it['ref']}:{vp}")
-                if nn:
-                    logic_vdd = nn
-                    break
-            if logic_vdd:
-                break
+    # vcc_pins / logic_vdd 已在 ④ 中按符号真实引脚名算好，绝不硬编码 pin 号：
+    # CH340G 的 VCC=16，但 CP2102 的 16 脚是 WAKEUP/GPIO.3，硬编码会接错。
     if logic_vdd:
         for vp in vcc_pins:
             vpin = f"{ur}:{vp}"
@@ -1644,22 +1849,117 @@ def _looks_uart_symbol(item, lib) -> bool:
 def _mcu_uart_role(pin_name: str, net_name: str) -> str | None:
     """按引脚名/网名判断 MCU 脚是串口发送(TX)还是接收(RX)。
 
-    通用判据：名字里含 TX/RX 语义直接用；STM32F1 的默认 USART1 脚
-    PA9=TX / PA10=RX 作为数据手册常识回退。不绑定位号、不针对单图。
+    引脚名的 UART 语义优先于网名：LLM 常把网线命名成 UART_TX，
+    却把 MCU 的 RX(PA10) 和 UART 的 RXD 都塞进去；若把网名一起混判，
+    同时含 TX/RX 会判不出来，交叉修复就永远漏掉。不绑定位号，
+    PA9/PA10 仅作为 STM32F1 数据手册常识回退。
     """
-    s = f"{pin_name} {net_name}".upper()
-    has_tx = "TX" in s
-    has_rx = "RX" in s
+    p = str(pin_name or "").upper()
+    if _UART_MCU_TX_RE.search(p) or p == "PA9":
+        return "TX"
+    if _UART_MCU_RX_RE.search(p) or p == "PA10":
+        return "RX"
+    s = str(net_name or "").upper()
+    has_tx, has_rx = "TX" in s, "RX" in s
     if has_tx and not has_rx:
         return "TX"
     if has_rx and not has_tx:
         return "RX"
-    p = pin_name.upper()
-    if p == "PA9":
-        return "TX"
-    if p == "PA10":
-        return "RX"
     return None
+
+
+# MCU 上的 UART 功能脚：KiCad 的 alternate 名形如
+# "PA9 TIM1_CH2 USART1_TX" / "PA10 TIM1_CH3 USART1_RX"。
+# 只认 USART/UART 语义或明确的 TXD/RXD，不把 CAN_TX / USB_DP 当串口。
+_UART_MCU_TX_RE = re.compile(r"(?:usart|uart)\s*\d*\s*[_-]?\s*tx\b|\btxd\b", re.I)
+_UART_MCU_RX_RE = re.compile(r"(?:usart|uart)\s*\d*\s*[_-]?\s*rx\b|\brxd\b", re.I)
+
+
+def _mcu_uart_pin_candidates(item, lib) -> dict[str, list[tuple[int, str, str]]]:
+    """返回 MCU 上按 USART 编号排序的 TX/RX 候选脚：[(优先级, 脚号, 引脚名)]。"""
+    out: dict[str, list[tuple[int, str, str]]] = {"TX": [], "RX": []}
+    if lib is None:
+        return out
+    try:
+        if hasattr(lib, "pin_names_with_alts"):
+            names = lib.pin_names_with_alts(item.get("symbol", ""))
+        else:
+            names = lib.pin_names(item.get("symbol", ""))
+    except Exception:
+        return out
+    for num, nm in names.items():
+        text = str(nm).upper()
+        n = str(num)
+        order = re.search(r"usart\s*(\d+)", text, re.I)
+        prio = int(order.group(1)) if order else 99
+        for role, pat in (("TX", _UART_MCU_TX_RE), ("RX", _UART_MCU_RX_RE)):
+            if pat.search(text):
+                out[role].append((prio, n, text))
+    for role in out:
+        out[role].sort(key=lambda x: (x[0], int(x[1]) if x[1].isdigit() else 9999))
+    return out
+
+
+def _fix_uart_missing_link(items, ops, lib, fixes: list[str]) -> None:
+    """UART 的 TXD/RXD 整对漏接（或只接了一根）时，补到 MCU 的 USART 脚。
+
+    旧版 `_fix_uart_txrx_cross` 只在 TXD/RXD 已经接到 MCU 且方向接反时才对调；
+    若 LLM 干脆把 TXD/RXD 全部漏掉，MCU 侧 PA9/PA10 各自成为单脚网名，
+    ERC/视觉/安全/功能全绿，但 USB 转串口完全不通。这里按符号引脚名定位
+    双方的串口脚，只连接「悬空或仅自身单脚网」的引脚，避免劫持已复用网络。
+    """
+    if lib is None:
+        return
+    uarts = [it for it in items if _looks_uart_symbol(it, lib)]
+    mcus = [it for it in items if _is_mcu_item(it)]
+    if not uarts or not mcus:
+        return
+    for uart in uarts:
+        tx_pins = _p(uart, lib, "TXD") or _p(uart, lib, "TX")
+        rx_pins = _p(uart, lib, "RXD") or _p(uart, lib, "RX")
+        if not tx_pins or not rx_pins:
+            continue
+        handled = 0
+        for mcu in mcus:
+            cands = _mcu_uart_pin_candidates(mcu, lib)
+            if not cands["TX"] or not cands["RX"]:
+                continue
+
+            def dangling_mcu(role: str):
+                for _, num, nm in cands[role]:
+                    pin = f"{mcu['ref']}:{num}"
+                    net = ops.name(pin)
+                    if net is not None and len(ops.members(net)) > 1:
+                        continue       # 已被别的电路复用，绝不抢占
+                    return pin, net
+                return None, None
+
+            targets: dict[str, tuple[str, str]] = {}
+            for u_role, m_role in (("TX", "RX"), ("RX", "TX")):
+                up = f"{uart['ref']}:{next(iter(tx_pins if u_role == 'TX' else rx_pins))}"
+                u_net = ops.name(up)
+                if u_net is not None and len(ops.members(u_net)) > 1:
+                    continue           # UART 这根已经接好，不动
+                mp, m_net = dangling_mcu(m_role)
+                if not mp:
+                    continue
+                targets[m_role] = (up, m_net or f"UART_{m_role}", u_net)
+                if m_net is None:
+                    ops.attach(mp, targets[m_role][1])
+            if not targets:
+                continue
+            # 两个角色不能落到同一个网（防重复脚/误判）
+            if len({v[1] for v in targets.values()}) != len(targets):
+                continue
+            for m_role, (up, target, old_net) in targets.items():
+                ops.attach(up, target)
+                fixes.append(
+                    f"{uart['ref']} 的 {'TXD' if m_role == 'RX' else 'RXD'} 原"
+                    f"{'悬空' if not old_net else '仅单脚网 ' + old_net}，已接到 "
+                    f"{mcu['ref']} 的串口{'接收' if m_role == 'RX' else '发送'}脚 {target}")
+                handled += 1
+        if handled:
+            continue
 
 
 def _fix_uart_txrx_cross(items, ops, lib, fixes: list[str]) -> None:
@@ -2172,7 +2472,8 @@ def _fix_swd_clock(items, ops, lib, fixes: list[str]) -> None:
     """
     gnd = _gnd_net(ops)
     # SWDIO 所在连接器
-    swdio = next((n for n in ops.nets if re.search(r"swdio", n["name"], re.I)), None)
+    swdio = next((n for n in ops.nets
+                  if re.search(r"swdio", str(n.get("name") or ""), re.I)), None)
     if not swdio:
         return
     conn_ref = None
@@ -2185,7 +2486,8 @@ def _fix_swd_clock(items, ops, lib, fixes: list[str]) -> None:
     if not conn_ref:
         return
     # SWCLK 只有 MCU 单成员（未引出）
-    swclk = next((n for n in ops.nets if re.search(r"swclk|swdclk", n["name"], re.I)), None)
+    swclk = next((n for n in ops.nets
+                  if re.search(r"swclk|swdclk", str(n.get("name") or ""), re.I)), None)
     if not swclk or len(swclk["pins"]) != 1:
         return
     mcu_ref = swclk["pins"][0].partition(":")[0]
@@ -2292,7 +2594,7 @@ def _fix_usb_connector_ground(items, ops, lib, fixes: list[str]) -> None:
         if not ("conn_01x05" in sym or "usb_micro" in sym or "usb_type" in sym):
             continue
         ref = it["ref"]
-        netnames = [n["name"] for n in ops.nets
+        netnames = [str(n.get("name") or "") for n in ops.nets
                     if any(p.startswith(ref + ":") for p in n["pins"])]
         if not any(re.search(r"usb_d[+-]|(^|_)d[+-]$", n, re.I) for n in netnames):
             continue
@@ -2337,10 +2639,12 @@ def _fix_swd_breakout(items, ops, lib, fixes: list[str]) -> None:
     if not lib or not any(_is_mcu_item(it) for it in items):
         return
     swdio = next((n for n in ops.nets
-                  if re.search(r"swdio|swdat|jtms", n["name"], re.I)
+                  if re.search(r"swdio|swdat|jtms",
+                               str(n.get("name") or ""), re.I)
                   and len(n["pins"]) == 1), None)
     swclk = next((n for n in ops.nets
-                  if re.search(r"swclk|swck|jtc", n["name"], re.I)
+                  if re.search(r"swclk|swck|jtc",
+                               str(n.get("name") or ""), re.I)
                   and len(n["pins"]) == 1), None)
 
     # 更隐蔽的一种：LLM 连网名都没生成，SWD 脚完全不在网表里（被写成
@@ -2406,9 +2710,22 @@ def fix_topology(bom: dict, netlist: dict, symbol_lib=None) -> list[str]:
     fixes: list[str] = []
     if not items:
         return fixes
+    # LLM 偶尔会生成 name=null / 空串的网络；下游规则普遍假定 name 是字符串，
+    # 一旦为 None，re.search / .lower() 会抛 TypeError（网页曾实测复现）。
+    # 统一在这里补成唯一的安全网名，后续规则不必各自防御。
+    used_names = {str(n.get("name")) for n in ops.nets if isinstance(n.get("name"), str)}
+    for i, net in enumerate(ops.nets, 1):
+        if isinstance(net.get("name"), str) and net["name"].strip():
+            continue
+        name = f"NET_{i}"
+        while name in used_names:
+            name = f"NET_{i}_{len(used_names) + 1}"
+        net["name"] = name
+        used_names.add(name)
     _shorten_connector_net_names(ops)
     _fix_vbus_on_3v3_output(items, ops, symbol_lib, fixes)  # 先分离倒灌的 USB 5V，再让 _fix_power 拆 3.3V
     _fix_power(items, ops, symbol_lib, fixes)
+    _fix_dangling_chip_power(items, ops, symbol_lib, fixes)  # VDD/VBAT/VDDA 悬空或单脚网→并到 3.3V
     _fix_reset_pullup(items, ops, symbol_lib, fixes)
     _fix_led(items, ops, symbol_lib, fixes)
     _fix_mcu_pins(items, ops, symbol_lib, fixes)
@@ -2416,6 +2733,7 @@ def fix_topology(bom: dict, netlist: dict, symbol_lib=None) -> list[str]:
     _fix_uart_symbol(items, ops, symbol_lib, fixes)   # 先纠正型号/符号错配，再让 _fix_usb 补晶振
     _split_shared_crystal(items, ops, symbol_lib, fixes)  # 两芯片共用晶振→拆分，MCU 改用悬空的那颗
     _fix_usb(items, ops, symbol_lib, fixes)
+    _fix_uart_missing_link(items, ops, symbol_lib, fixes)  # TXD/RXD 整对漏接→补到 MCU USART 脚
     _fix_uart_txrx_cross(items, ops, symbol_lib, fixes)  # TXD/RXD 与 MCU TX/RX 直连→对调
     _fix_usb_connector_ground(items, ops, symbol_lib, fixes)  # USB 口 GND 悬空 → 补地
     _fix_swd_breakout(items, ops, symbol_lib, fixes)  # SWD 信号只挂单脚 → 加排针引出
