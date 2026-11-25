@@ -987,6 +987,67 @@ def _fix_floating_led_gpio(items, ops, lib, fixes):
         if fixed:
             break
 
+    # 兜底：有些生成结果把整组 GPIO 都引到了排针，网表里没有「单脚 GPIO 网」
+    # 可复用；此时从 MCU 符号里挑一个完全未使用、且不带特殊功能的 GPIO，
+    # 新建网络接走常亮电阻。否则用户指示灯永远亮、无法被程序控制。
+    for led in leds:
+        desc = f"{led.get('name', '')} {led.get('desc', '')}".lower()
+        if not re.search(r"用户|user", desc):
+            continue
+        a = next(iter(_p(led, lib, "A")), "2")
+        an = ops.name(f"{led['ref']}:{a}")
+        if not an:
+            continue
+        for p in sorted(ops.members(an)):
+            rr, _, num = p.partition(":")
+            rit = by_ref.get(rr)
+            if not rit or not rit.get("symbol", "").lower().startswith("device:r"):
+                continue
+            other = f"{rr}:{'2' if num == '1' else '1'}"
+            on = ops.name(other)
+            if not (on and (_SUPPLY_RE.match(on) or _V33_NAME_RE.search(on))):
+                continue
+            for mcu in mcu_items:
+                if lib is None:
+                    break
+                try:
+                    primary = lib.pin_names(mcu["symbol"])
+                    alts = lib.pin_names_with_alts(mcu["symbol"])
+                except Exception:
+                    break
+                # 偏好 PC13（常见用户灯脚），其次按端口/编号自然序。
+                def _gpio_sort(item):
+                    nm = str(item[1]).split()[0].upper()
+                    pref = 0 if nm == "PC13" else 1
+                    m = re.fullmatch(r"([A-Z])(\d+)", nm)
+                    return (pref, m.group(1) if m else "Z",
+                            int(m.group(2)) if m else 999)
+                candidates = [
+                    (n, nm) for n, nm in primary.items()
+                    if _PORT_GROUP_RE.fullmatch(str(nm).split()[0])
+                ]
+                for n, nm in sorted(candidates, key=_gpio_sort):
+                    pin = f"{mcu['ref']}:{n}"
+                    if ops.name(pin):
+                        continue                     # 已用脚不动
+                    full = str(alts.get(n, nm)).upper()
+                    if any(k in full for k in ("SWD", "JTMS", "JTCK", "JTDI",
+                                               "JTDO", "USART", "UART", "OSC",
+                                               "XTAL", "BOOT", "NRST", "RESET",
+                                               "VDD", "VSS", "GND", "VBAT")):
+                        continue
+                    gpio_net = str(nm).split()[0]
+                    if gpio_net in {x["name"] for x in ops.nets}:
+                        gpio_net = f"{mcu['ref']}_{gpio_net}"
+                    ops.attach(pin, gpio_net)
+                    ops.attach(other, gpio_net)
+                    fixes.append(
+                        f"{led['ref']}（用户指示灯）原经 {rr} 常亮在 {on}，"
+                        f"已把 {rr} 改接空闲 GPIO {pin}（{gpio_net}），"
+                        f"形成 {gpio_net}→{rr}→{led['ref']}→GND")
+                    break
+            break
+
 
 def _fix_reversed_led(items, ops, lib, fixes):
     """纠正 LED 极性接反：阳极接 GND、阴极经限流电阻接电源。
@@ -1054,6 +1115,29 @@ def _fix_led_cathode_resistor_to_gpio(items, ops, lib, fixes: list[str]) -> None
         a_net, k_net = ops.name(a_pin), ops.name(k_pin)
         if not a_net or not k_net or _GND_RE.search(k_net) or _SUPPLY_RE.match(k_net):
             continue
+        # 另一种形态：阳极整脚悬空（只有 LED 自己），阴极经电阻回到 GPIO。
+        # 例如 LED2_A=[LED2:2]、LED2_K=[LED2:1,R3:2]、R3:1 在 PC13_LED。
+        # 把电阻的阴极侧挪到阳极网、阴极直接接地，形成 GPIO→R→LED→GND。
+        a_members = ops.members(a_net)
+        if len(a_members) == 1 and a_pin in a_members:
+            k_members = ops.members(k_net)
+            if len(k_members) == 2:
+                rp = next((p for p in k_members if p != k_pin), None)
+                if rp:
+                    ref, _, num = rp.partition(":")
+                    rit = by_ref.get(ref)
+                    other = f"{ref}:{'2' if num == '1' else '1'}"
+                    o_net = ops.name(other)
+                    if (rit and rit.get("symbol", "").lower().startswith("device:r")
+                            and o_net and any(p.partition(":")[0] in mcu_refs
+                                              for p in ops.members(o_net))):
+                        ops.attach(rp, a_net)
+                        ops.attach(k_pin, gnd)
+                        fixes.append(
+                            f"LED {led['ref']} 阳极原悬空、阴极经 {ref} 回 GPIO({o_net})；"
+                            f"已把 {ref} 挪到阳极侧、阴极接地："
+                            f"GPIO({o_net})→{ref}→{led['ref']}→GND")
+                        continue
         if not any(p.partition(":")[0] in mcu_refs for p in ops.members(a_net)):
             continue                     # 阳极不是 GPIO 驱动
         k_members = ops.members(k_net)
@@ -2276,6 +2360,34 @@ def _drop_duplicate_ghost_items(items, ops, fixes: list[str]) -> None:
                 f"未接任何网络且网表中已有相同的 {dup['ref']}）")
 
 
+def _drop_fully_isolated_passives(items, ops, fixes: list[str]) -> None:
+    """删除两端都落在单脚孤立网的 R/C/L：这种件不在任何回路里。
+
+    LLM 偶尔会把一颗电容的两脚各放进一个「只有自己」的网（C5_1/C5_2），
+    ERC/视觉都不报，功能自检会报两脚悬空。它既不是负载电容也不是退耦，
+    直接删除并清理 BOM，避免用户多买料。
+    """
+    for it in list(items):
+        sym = it.get("symbol", "").lower()
+        if not (sym.startswith("device:c") or sym.startswith("device:r")
+                or sym.startswith("device:l")):
+            continue
+        ref = it["ref"]
+        isolated = []
+        for num in ("1", "2"):
+            pin = f"{ref}:{num}"
+            name = ops.name(pin)
+            if not name or len(ops.members(name)) == 1:
+                isolated.append((pin, name))
+        if len(isolated) != 2:
+            continue
+        for pin, _name in isolated:
+            ops.clear_pin(pin)
+        items.remove(it)
+        fixes.append(f"删除完全悬空的 {ref}（{it.get('value', '')}）："
+                     f"两脚各占一个单脚网，不构成任何回路")
+
+
 def _drop_floating_passives(items, ops, fixes: list[str]) -> None:
     """删除「一端接 GND、另一端完全悬空」的残留无源件（C/R/L）。
 
@@ -2371,7 +2483,11 @@ def _reattach_orphan_ground_pins(items, ops, fixes: list[str], lib=None) -> None
                 if lib is not None else ""
         except Exception:
             pname = ""
-        if pname and not any(k in pname for k in ("gnd", "vss", "k", "cath", "ground")):
+        # Device:C/R/L 的引脚名常写成 "~"（非极性无源件），不是"非地脚"；
+        # 网名已同时满足 GND 语义和位号对应，足够安全。
+        passive = item.get("symbol", "").lower().startswith(("device:c", "device:r", "device:l"))
+        if (pname and not any(k in pname for k in ("gnd", "vss", "k", "cath", "ground"))
+                and not (passive and pname in ("~", ""))):
             continue
         real["pins"].append(pin)
         net["pins"].remove(pin)
@@ -2708,11 +2824,20 @@ def _fix_usb_connector_ground(items, ops, lib, fixes: list[str]) -> None:
         if gnd_pin is None:
             continue
         pin = f"{ref}:{gnd_pin}"
-        if ops.name(pin):          # 已接任何网就不动，只补真正悬空的
-            continue
-        ops.attach(pin, gnd)
-        fixes.append(f"USB 连接器 {ref} 的 GND 脚 {gnd_pin} 原悬空，已接 {gnd}"
-                     f"（否则 USB 无回流地，转串口不可用）")
+        current = ops.name(pin)
+        if current and _GND_RE.search(current):
+            continue                   # 已正确接地，幂等
+        if current and not (re.search(r"nrst|reset|复位", current, re.I)
+                            or (d_p == "3" and d_m == "2")):
+            continue                   # 已接到别的合理网就不动
+        if current:
+            ops.attach(pin, gnd)
+            fixes.append(f"USB 连接器 {ref} 的 GND 脚 {gnd_pin} 原接 {current}，"
+                         f"已改接 {gnd}（否则 USB 无回流地，转串口不可用）")
+        else:
+            ops.attach(pin, gnd)
+            fixes.append(f"USB 连接器 {ref} 的 GND 脚 {gnd_pin} 原悬空，已接 {gnd}"
+                         f"（否则 USB 无回流地，转串口不可用）")
         # 标注错配：写着「SWD/调试」的口却接成 USB D±，会把 BOM/贴装带偏。
         ident = f"{it.get('name', '')} {it.get('desc', '')}"
         if re.search(r"swd|jtag|调试", ident, re.I):
@@ -2746,7 +2871,7 @@ def _fix_swd_breakout(items, ops, lib, fixes: list[str]) -> None:
     # no_connect）。此时网名语义规则找不到任何东西，但芯片照样烧不进程序。
     # 按符号真实引脚名（SWDIO/SWDAT/JTMS、SWCLK/SWCK/JTCK）定位 MCU 脚，
     # 若该脚悬空则新建网名，交给下面统一加排针。
-    def _mcu_swd_pin(kind: str) -> str | None:
+    def _mcu_swd_pin(kind: str, require_unconnected: bool = True) -> str | None:
         pat = re.compile(r"swdio|swdat|jtms" if kind == "io" else r"swclk|swck|jtc", re.I)
         for it in items:
             if not _is_mcu_item(it):
@@ -2760,20 +2885,35 @@ def _fix_swd_breakout(items, ops, lib, fixes: list[str]) -> None:
             for num, nm in names.items():
                 if pat.search(str(nm)):
                     pin = f"{it['ref']}:{num}"
-                    if not ops.name(pin):          # 完全悬空才处理
-                        return pin
+                    if require_unconnected and ops.name(pin):
+                        continue               # 完全悬空才处理
+                    return pin
         return None
 
-    if not swdio or not swclk:
-        io_pin = _mcu_swd_pin("io") if not swdio else None
-        clk_pin = _mcu_swd_pin("clk") if not swclk else None
-        if io_pin:
-            nn = f"{io_pin.replace(':', '_')}_SWDIO"
-            swdio = ops.ensure(nn)
+    if not swdio and not swclk:
+        # 两路都没有单脚网：只有「引脚完全悬空」才需要新建网名并加排针；
+        # 若两路都已接到连接器，则已引出，直接返回，保证幂等。
+        io_pin = _mcu_swd_pin("io", require_unconnected=True)
+        clk_pin = _mcu_swd_pin("clk", require_unconnected=True)
+        if not io_pin and not clk_pin:
+            return
+    elif not swdio or not swclk:
+        # 不对称情形：SWDIO 已引出、SWCLK 只有 MCU 单脚（或反过来）。
+        # 不能因为其中一路上已有排针就放弃补另一路，否则调试器仍接不上。
+        io_pin = _mcu_swd_pin("io", require_unconnected=False) if not swdio else None
+        clk_pin = _mcu_swd_pin("clk", require_unconnected=False) if not swclk else None
+    else:
+        io_pin = clk_pin = None
+
+    if io_pin:
+        nn = ops.name(io_pin) or f"{io_pin.replace(':', '_')}_SWDIO"
+        swdio = ops.ensure(nn)
+        if io_pin not in swdio["pins"]:
             swdio["pins"].append(io_pin)
-        if clk_pin:
-            nn = f"{clk_pin.replace(':', '_')}_SWCLK"
-            swclk = ops.ensure(nn)
+    if clk_pin:
+        nn = ops.name(clk_pin) or f"{clk_pin.replace(':', '_')}_SWCLK"
+        swclk = ops.ensure(nn)
+        if clk_pin not in swclk["pins"]:
             swclk["pins"].append(clk_pin)
     if not swdio or not swclk:
         return
@@ -2839,6 +2979,7 @@ def fix_topology(bom: dict, netlist: dict, symbol_lib=None) -> list[str]:
     _drop_half_wired_leds(items, ops, fixes)
     ops.drop_empty()
     _fix_crystal_load_caps(items, ops, symbol_lib, fixes)  # 晶振负载电容先补齐，别被下面断头件规则删掉
+    _drop_fully_isolated_passives(items, ops, fixes)  # 两端都悬空的 R/C/L→删除
     _drop_dead_end_passives(items, ops, fixes)
     _drop_floating_passives(items, ops, fixes)
     _drop_duplicate_ghost_items(items, ops, fixes)
