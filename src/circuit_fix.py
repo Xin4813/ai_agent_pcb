@@ -1518,6 +1518,197 @@ def _is_mcu_item(it: dict) -> bool:
             or "stm32f1" in it.get("symbol", "").lower())
 
 
+_FP_PINCOUNT_RE = re.compile(r"(?:^|[-_])(\d+)\s*[xX]\s*(\d+)(?:$|[-_.])")
+
+
+def _footprint_mismatch(items, lib) -> list[tuple[str, str, int, int]]:
+    """BOM 封装针脚数明显少于符号引脚数时返回失配列表。
+
+    LLM 常把「4 针串口模块接口」写成 CH340G 符号却保留 PinHeader_1x04 封装。
+    原理图/ERC 都正常，BOM 却会让采购拿错件；按脚数做通用判据，不靠位号。
+    """
+    bad: list[tuple[str, str, int, int]] = []
+    if lib is None:
+        return bad
+    for it in items:
+        fp = str(it.get("footprint", "")).strip()
+        sym = str(it.get("symbol", ""))
+        if not fp or "connector:" in sym.lower() or "conn_01x" in sym.lower():
+            continue
+        m = _FP_PINCOUNT_RE.search(fp)
+        if not m:
+            continue
+        fp_pins = int(m.group(1)) * int(m.group(2))
+        try:
+            sym_pins = len(lib.pin_names(sym))
+        except Exception:
+            continue
+        if sym_pins > fp_pins:
+            bad.append((it["ref"], fp, fp_pins, sym_pins))
+    return bad
+
+
+_DEFAULT_FOOTPRINTS = {
+    "Interface_USB:CH340G": "Package_SO:SOIC-16_3.9x9.9mm_P1.27mm",
+}
+
+
+def _sync_footprints(items, lib, fixes: list[str]) -> None:
+    """把与符号脚数冲突的 BOM 封装改成该符号的合理封装（无映射则清空）。"""
+    for ref, fp, fp_pins, sym_pins in _footprint_mismatch(items, lib):
+        it = next(x for x in items if x["ref"] == ref)
+        sym = str(it.get("symbol", ""))
+        new = _DEFAULT_FOOTPRINTS.get(sym, "")
+        it["footprint"] = new
+        fixes.append(
+            f"{ref} 的 BOM 封装 {fp} 只有 {fp_pins} 脚、符号 {sym} 有 {sym_pins} 脚，"
+            f"已改为 {new or '空（待按符号选型）'}，避免采购错件")
+
+
+def _sync_uart_bom_text(items, lib, fixes: list[str]) -> None:
+    """符号已是串口芯片但 BOM 仍写「模块接口」时同步名称/描述。
+
+    LLM 常把 4 针 USB 转串口模块接口写成 CH340G 芯片；修复后符号、引脚、
+    封装都按芯片处理，BOM 的 name/desc 若还写「连接模块（TX/RX/VCC/GND）」
+    就会与 16 脚 SOIC 芯片自相矛盾。按符号语义判断，不靠位号。
+    """
+    for it in items:
+        sym = str(it.get("symbol", ""))
+        try:
+            if lib is None or not _looks_uart_symbol(it, lib):
+                continue
+        except Exception:
+            continue
+        text = f"{it.get('name', '')} {it.get('desc', '')}"
+        value = str(it.get("value", ""))
+        stale_text = bool(re.search(r"模块接口|module\s*interface|连接.{0,8}模块", text, re.I))
+        stale_value = bool(re.search(r"模块|接口|module|interface", value, re.I))
+        if not stale_text and not stale_value:
+            continue
+        model = re.sub(r"(模块|接口|module|interface).*$", "", value, flags=re.I).strip()
+        model = model or "USB转串口芯片"
+        it["value"] = model
+        it["name"] = f"USB转串口芯片（{model}）"
+        it["desc"] = f"USB 转串口芯片（{model}），需配晶振与负载电容"
+        fixes.append(f"{it['ref']} 的 BOM 仍写「模块接口」，已同步为 {model} 芯片描述")
+
+
+_VOLT_DECL_RE = re.compile(r"(?<![\d.])(\d+(?:\.\d+)?)\s*[vV](?![A-Za-z0-9])")
+
+
+def _declared_voltage(item: dict) -> float | None:
+    """从 BOM 的 value/name/desc 读元件自己声明的工作电压（V）。
+
+    典型：电源输入接口 value=5V、desc=5V电源输入；SWD 排针 desc 里虽含
+    VCC 但没有数字+V，返回 None，不会被误判成电源输入。
+    """
+    text = " ".join(str(item.get(k, "")) for k in ("value", "name", "desc"))
+    m = _VOLT_DECL_RE.search(text)
+    return float(m.group(1)) if m else None
+
+
+def _regulator_in_net(ops, items, lib, max_voltage: float = 4.5) -> str | None:
+    """找低压稳压器的输入网（未稳压的 5V 来源）。"""
+    for it in items:
+        if "regulator" not in it.get("symbol", "").lower():
+            continue
+        v = _regulator_output(it)
+        if v is None or v >= max_voltage:
+            continue
+        for p in _p(it, lib, "VI") or _p(it, lib, "VIN"):
+            n = ops.name(f"{it['ref']}:{p}")
+            if n and not _GND_RE.search(n):
+                return n
+    return None
+
+
+def _net_rail_voltage(ops, items, lib, net: str) -> float | None:
+    """推断网络电压：优先稳压器 VO/VI 的实际接线，其次网名。
+
+    稳压器 VI 所在网是「未稳压输入」，不能因为网名带 3V3 就当成 3.3V 输出；
+    这条顺序避免把 NET_3V3_IN（LDO 的 5V 输入）误判成 3.3V 网。
+    """
+    if not net or _GND_RE.search(net):
+        return None
+    for it in items:
+        if "regulator" not in it.get("symbol", "").lower():
+            continue
+        v = _regulator_output(it)
+        if v is None:
+            continue
+        for role in ("VO", "VOUT"):
+            for p in _p(it, lib, role):
+                if ops.name(f"{it['ref']}:{p}") == net:
+                    return v
+        for role in ("VI", "VIN"):
+            for p in _p(it, lib, role):
+                if ops.name(f"{it['ref']}:{p}") == net:
+                    return None
+    if _V33_NAME_RE.search(net):
+        return 3.3
+    if re.search(r"(?:^|[_+])5v(?:$|[_+])|vbus", net, re.I):
+        return 5.0
+    m = re.search(r"(?:^|[_+])(\d+(?:\.\d+)?)v(?:$|[_+])", net, re.I)
+    return float(m.group(1)) if m else None
+
+
+def _v33_rail_nets(ops, items, lib) -> set[str]:
+    """所有 3.3V 稳压器输出网（真 3.3V 电源域）。"""
+    out: set[str] = set()
+    for it in items:
+        v = _regulator_output(it)
+        if v is None or abs(v - 3.3) >= 0.2:
+            continue
+        for role in ("VO", "VOUT"):
+            for p in _p(it, lib, role):
+                n = ops.name(f"{it['ref']}:{p}")
+                if n:
+                    out.add(n)
+    return out
+
+
+def _fix_power_input_connector(items, ops, lib, fixes: list[str]) -> None:
+    """声明 5V 的电源输入接口误接 3.3V 输出网时，改接稳压器未稳压输入。
+
+    ERC 只检查引脚电气类型，网名 VCC 也常被当成普通电源，因此「外部 5V
+    直接灌进 3.3V 域」可以五维全绿却烧芯片。判据不看位号：任何连接器只要
+    BOM 明确声明 ≥4.5V，且其脚落在 3.3V 稳压器输出网，就迁到稳压器输入网。
+    """
+    raw = _regulator_in_net(ops, items, lib)
+    if not raw:
+        raw = _usb_vbus_net(ops, items, lib)
+    if not raw:
+        return
+    v33 = _v33_rail_nets(ops, items, lib)
+    if not v33:
+        return
+    for it in items:
+        sym = str(it.get("symbol", "")).lower()
+        if not ("connector:" in sym or "conn_01x" in sym):
+            continue
+        declared = _declared_voltage(it)
+        if declared is None or declared < 4.5:
+            continue
+        ref = it["ref"]
+        try:
+            nums = [str(n) for n in (lib.pin_names(it["symbol"]) if lib else {})]
+        except Exception:
+            nums = []
+        if not nums:
+            nums = ["1", "2"]
+        for num in nums:
+            pin = f"{ref}:{num}"
+            net = ops.name(pin)
+            if not net or _GND_RE.search(net) or net == raw:
+                continue
+            if net not in v33 and _net_rail_voltage(ops, items, lib, net) != 3.3:
+                continue
+            ops.attach(pin, raw)
+            fixes.append(
+                f"{ref} 标注 {declared:g}V 电源输入，{pin} 原接 3.3V 网 {net}，"
+                f"已改接稳压器输入网 {raw}，避免外部 {declared:g}V 直接灌入 3.3V 芯片")
+
+
 def _usb_vbus_net(ops, items, lib) -> str | None:
     """找 USB VBUS 的 5V 来源；没有真实来源时返回 None，避免凭空造电源。"""
     for it in items:
@@ -2223,11 +2414,15 @@ def _fix_uart_symbol(items, ops, lib, fixes):
             continue
 
         # 换成 CH340G（_fix_usb 已支持它补晶振/对调 D+/D−）
+        # BOM 的 name/value/footprint/desc 必须跟着符号一起换：LLM 常把
+        # 「4 针串口模块接口」写成 CH340G，若只换符号不换封装，BOM 仍写
+        # PinHeader_1x04，与 16 脚芯片自相矛盾，采购/打板会拿错件。
         new_sym = "Interface_USB:CH340G"
         it["symbol"] = new_sym
-        if not it.get("name") or "串口" not in str(it.get("name", "")):
-            it["name"] = "USB转串口（CH340G）"
+        it["name"] = "USB转串口芯片（CH340G）"
         it["value"] = "CH340G"
+        it["footprint"] = "Package_SO:SOIC-16_3.9x9.9mm_P1.27mm"
+        it["desc"] = "USB 转串口芯片（CH340G），需配 12MHz 晶振与负载电容"
 
         # 按网络名语义决定该网络应接到新符号的哪个引脚名
         def role_of(net_name: str):
@@ -2265,8 +2460,8 @@ def _fix_uart_symbol(items, ops, lib, fixes):
             remapped.append(f"{net_name}→{role}({pins[0]})")
         if remapped:
             fixes.append(
-                f"{ref} 型号与符号不符（{old_sym}），已改用 CH340G 并按网络语义重映射引脚："
-                + "，".join(remapped))
+                f"{ref} 型号与符号不符（{old_sym}），已改用 CH340G、同步 BOM 封装为 SOIC-16 "
+                f"并按网络语义重映射引脚：" + "，".join(remapped))
 
 
 def _drop_stale_migration_fixes(ops, fixes: list[str]) -> None:
@@ -2961,6 +3156,7 @@ def fix_topology(bom: dict, netlist: dict, symbol_lib=None) -> list[str]:
     _fix_vbus_on_3v3_output(items, ops, symbol_lib, fixes)  # 先分离倒灌的 USB 5V，再让 _fix_power 拆 3.3V
     _fix_power(items, ops, symbol_lib, fixes)
     _fix_regulator_input(items, ops, symbol_lib, fixes)  # 稳压器 VI 悬空→补输入电源网/接口
+    _fix_power_input_connector(items, ops, symbol_lib, fixes)  # 标注 5V 的输入口误接 3.3V 网→回到稳压器输入
     _fix_dangling_chip_power(items, ops, symbol_lib, fixes)  # VDD/VBAT/VDDA 悬空或单脚网→并到 3.3V
     _fix_reset_pullup(items, ops, symbol_lib, fixes)
     _fix_led(items, ops, symbol_lib, fixes)
@@ -2984,5 +3180,7 @@ def fix_topology(bom: dict, netlist: dict, symbol_lib=None) -> list[str]:
     _drop_floating_passives(items, ops, fixes)
     _drop_duplicate_ghost_items(items, ops, fixes)
     _drop_stale_migration_fixes(ops, fixes)
+    _sync_footprints(items, symbol_lib, fixes)  # BOM 封装脚数必须与符号一致
+    _sync_uart_bom_text(items, symbol_lib, fixes)  # 串口芯片的 BOM 文案同步
     validate_netlist(netlist, bom)
     return fixes

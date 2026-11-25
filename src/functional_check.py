@@ -140,6 +140,41 @@ def _check_connector_function(items: list, by_ref: dict, pin_net: dict,
             if len(members) <= 1:
                 issues.append(f"{n}（{label}）只挂在 {sorted(members)} 一个脚上、"
                               f"未引出到调试排针——调试器无法连接")
+    # 3) 声明 5V 的电源输入接口若挂在 3.3V 稳压输出网，外部 5V 会直接灌进
+    #    3.3V 域烧芯片。ERC 只看引脚类型、视觉只看几何，四检全绿也会漏。
+    #    判据只看 BOM 声明电压 + 稳压器 VO/VI 实际接线，与网名/位号无关。
+    try:
+        from .circuit_fix import (_declared_voltage, _net_rail_voltage,
+                                  _v33_rail_nets)
+
+        class _Ops:
+            def name(self, pin):
+                r, _, n = pin.partition(":")
+                return pin_net.get((r, n))
+
+        ops = _Ops()
+        v33_nets = _v33_rail_nets(ops, items, symbol_lib)
+        for it in items:
+            sym = str(it.get("symbol", "")).lower()
+            if not ("connector:" in sym or "conn_01x" in sym):
+                continue
+            declared = _declared_voltage(it)
+            if declared is None or declared < 4.5:
+                continue
+            ref = it.get("ref", "")
+            for (r, num), net in sorted(pin_net.items()):
+                if r != ref or not net or _GND_RE.search(net):
+                    continue
+                if net not in v33_nets and _net_rail_voltage(
+                        ops, items, symbol_lib, net) != 3.3:
+                    continue
+                checked += 1
+                issues.append(
+                    f"{ref} 标注 {declared:g}V 电源输入，{r}:{num} 却接在 3.3V 网 {net}"
+                    f"——外部 {declared:g}V 会绕过稳压器直接灌入 3.3V 芯片")
+    except Exception:
+        pass
+
     # 2b) 更隐蔽：网名都没生成，MCU 的 SWD 脚完全不在网表里。
     #     按符号引脚名语义定位；已接出（pin_net 有值）的不报。
     if symbol_lib:
@@ -508,6 +543,18 @@ def check_functional(bom: dict, netlist: dict, symbol_lib=None) -> dict:
                     f"{'悬空' if not net else '只在单脚网 ' + net}，"
                     f"未接到 MCU 的 USART_{m_role} 脚——USB 转串口不通")
                 checked += 1
+    except Exception:
+        pass
+
+    # 6g) BOM 自洽：封装针脚数少于符号引脚数（典型：CH340G 仍写 4 针排针）。
+    #     这是采购/打板层面的硬错误，原理图与 ERC 都看不出来。
+    try:
+        from .circuit_fix import _footprint_mismatch
+        for ref, fp, fp_pins, sym_pins in _footprint_mismatch(items, symbol_lib):
+            issues.append(
+                f"{ref} 的 BOM 封装 {fp} 仅 {fp_pins} 脚，但符号有 {sym_pins} 脚——"
+                f"按此清单采购/打板会拿到错误器件")
+            checked += 1
     except Exception:
         pass
 
