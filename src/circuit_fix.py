@@ -384,6 +384,48 @@ def _fix_power(items, ops, lib, fixes):
     fixes.append(f"把 {', '.join(chip_refs)} 的 {'/'.join(moved_names)} 从 {old} 迁到 {v33}")
 
 
+def _fix_regulator_input(items, ops, lib, fixes: list[str]) -> None:
+    """稳压器 VI/VIN 悬空时补 5V 输入网（必要时新增 2 针电源接口）。
+
+    LLM 常把 3.3V 稳压器的输出/地接好，却把输入端整脚漏掉；ERC 与四层视觉
+    检查都不报，板子实际没有电源入口。若板上已有 5V/VBUS 网就直接并入，
+    否则新增 Conn_01x02_Pin 作为 5V_IN↔GND 输入，保证有实际来源。
+    """
+    gnd = _gnd_net(ops)
+    if not gnd:
+        return
+    vbus = _usb_vbus_net(ops, items, lib)
+    if not vbus:
+        for net in ops.nets:
+            if re.search(r"(?:^|[_+])(?:5v|vbus|vin)(?:$|[_+])", net["name"], re.I):
+                vbus = net["name"]
+                break
+    for reg in items:
+        if "regulator" not in reg.get("symbol", "").lower():
+            continue
+        pins = _p(reg, lib, "VI") or _p(reg, lib, "VIN")
+        if not pins:
+            continue
+        for p in pins:
+            pin = f"{reg['ref']}:{p}"
+            net = ops.name(pin)
+            if net and len(ops.members(net)) > 1:
+                continue
+            if not vbus:
+                ref = _add_ref(items, "J")
+                j = {"ref": ref, "name": "电源输入", "value": "5V 输入",
+                     "qty": 1, "symbol": "Connector:Conn_01x02_Pin", "footprint": ""}
+                items.append(j)
+                ops.attach(f"{ref}:1", f"{reg['ref']}_VIN")
+                ops.attach(f"{ref}:2", gnd)
+                vbus = f"{reg['ref']}_VIN"
+                fixes.append(f"稳压器 {reg['ref']} 的输入悬空，新增 {ref}（5V 输入↔GND）")
+            ops.attach(pin, vbus)
+            fixes.append(
+                f"稳压器 {reg['ref']} 的 VI 脚 {pin} 原"
+                f"{'悬空' if not net else '仅单脚网 ' + net}，已接到输入电源网 {vbus}")
+
+
 def _fix_dangling_chip_power(items, ops, lib, fixes: list[str]) -> None:
     """3.3V 芯片的 VDD/VBAT/VDDA 若悬空或只挂在自己的单脚网，并到 3.3V 电源。
 
@@ -435,12 +477,13 @@ def _fix_dangling_chip_power(items, ops, lib, fixes: list[str]) -> None:
                 pin = f"{it['ref']}:{p}"
                 net = ops.name(pin)
                 if net and len(ops.members(net)) > 1:
-                    # 「VDDA 脚 + 一只电容，电容另一端留在 C8_2 这类孤立网」
-                    # 不是真实供电/滤波网络：电源脚没接到 3.3V，退耦也不成立。
-                    # 判据：该网成员只能是 3.3V 芯片供电脚 + 电容脚，且每只电容
-                    # 的另一端是悬空或仅自身的孤立网（不能是 GND/电源/信号网）。
-                    stub_caps: list[tuple[str, str]] = []
-                    stub_ok = bool(gnd)
+                    # 「电源脚 + 退耦电容」若没有接到电源网就是假性滤波：
+                    #  - 电容另一端留在 C8_2 这类孤立网：退耦根本不成立；
+                    #  - 电容另一端已接 GND：网络仍只有芯片脚和电容，电源域悬空。
+                    # 判据：该网成员只能是 3.3V 芯片供电脚 + 电容脚（不能混进
+                    # 其它芯片/电源/信号脚），才并入 3.3V 网。
+                    caps: list[tuple[str, str, bool]] = []
+                    stub_ok = bool(gnd) and net != rail
                     for other in ops.members(net):
                         if other in power_pins:
                             continue
@@ -452,19 +495,21 @@ def _fix_dangling_chip_power(items, ops, lib, fixes: list[str]) -> None:
                             break
                         opposite = f"{ref}:{'2' if num == '1' else '1'}"
                         oname = ops.name(opposite)
-                        if oname and (len(ops.members(oname)) > 1 or _GND_RE.search(oname)):
+                        grounded = bool(oname and _GND_RE.search(oname))
+                        if oname and not grounded and len(ops.members(oname)) > 1:
                             stub_ok = False
                             break
-                        stub_caps.append((other, opposite))
-                    if stub_ok and stub_caps:
+                        caps.append((other, opposite, grounded))
+                    if stub_ok and caps:
                         for pp in sorted(p for p in ops.members(net) if p in power_pins):
                             ops.attach(pp, rail)
-                        for cap_pin, opposite in stub_caps:
+                        for cap_pin, opposite, grounded in caps:
                             ops.attach(cap_pin, rail)
-                            ops.attach(opposite, gnd)
+                            if not grounded:
+                                ops.attach(opposite, gnd)
                         fixes.append(
-                            f"{pin}（{name}）原在 {net} 只与退耦电容组成孤立支路，"
-                            f"已把 {name} 和电容并入 {rail}、电容另一端接 {gnd}")
+                            f"{pin}（{name}）原在 {net} 只与退耦电容组成孤立电源域，"
+                            f"已把 {name} 和电容并入 {rail}")
                         continue
                     continue                   # 已有真实供电/滤波网络
                 ops.attach(pin, rail)
@@ -2188,13 +2233,21 @@ def _fix_reset_pullup(items, ops, lib, fixes: list[str]) -> None:
                 continue
             other = f"{ref}:{'2' if num == '1' else '1'}"
             on = ops.name(other)
-            if not on or not _GND_RE.search(on):
+            isolated_pu = (
+                bool(on)
+                and len(ops.members(on)) == 1
+                and (re.search(r"(?:^|_)(?:pu|pullup|pull_up)(?:$|_)", on, re.I)
+                     or ref.lower() in on.lower()
+                     or "nrst" in on.lower())
+            )
+            if on and not (_GND_RE.search(on) or isolated_pu):
                 continue
+            prev = "悬空" if not on else ("GND" if _GND_RE.search(on) else f"孤立网 {on}")
             ops.attach(other, vdd)
             rit["name"] = "电阻（NRST 上拉）"
             rit["desc"] = "NRST 上拉电阻，复位按键按下时接 GND"
             fixes.append(
-                f"{ref} 从 GND 改接 {vdd}，作为 {it['ref']} 的 NRST 上拉"
+                f"{ref} 从 {prev} 改接 {vdd}，作为 {it['ref']} 的 NRST 上拉"
                 f"（复位按键仍接 GND）")
 
 
@@ -2767,6 +2820,7 @@ def fix_topology(bom: dict, netlist: dict, symbol_lib=None) -> list[str]:
     _shorten_connector_net_names(ops)
     _fix_vbus_on_3v3_output(items, ops, symbol_lib, fixes)  # 先分离倒灌的 USB 5V，再让 _fix_power 拆 3.3V
     _fix_power(items, ops, symbol_lib, fixes)
+    _fix_regulator_input(items, ops, symbol_lib, fixes)  # 稳压器 VI 悬空→补输入电源网/接口
     _fix_dangling_chip_power(items, ops, symbol_lib, fixes)  # VDD/VBAT/VDDA 悬空或单脚网→并到 3.3V
     _fix_reset_pullup(items, ops, symbol_lib, fixes)
     _fix_led(items, ops, symbol_lib, fixes)
