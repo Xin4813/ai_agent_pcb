@@ -730,6 +730,12 @@ def write_schematic(netlist: dict, bom: dict, output_path, symbols_dir,
         except Exception:
             etype_cache[it["ref"]] = {}
 
+    # 晶振网络专用：Y1 与 C1/C2 常因布局被挤到远离 MCU 的位置，三端长网若
+    # 走实线会绕芯片一整圈。仅这类「含晶振的多端长网」改用两端同名标签，
+    # 其它多端网仍走原 MST 实线，避免标签挤到同一段导线上误合并网络。
+    crystal_refs = {r for r, (sym, _pins) in pin_cache.items()
+                    if "Crystal" in sym}
+
     # 每个符号的占位包围盒 (x, y, 半宽, 半高)，供 PWR_FLAG 放置避让
     boxes = []
     for it in items:
@@ -1008,9 +1014,13 @@ def write_schematic(netlist: dict, bom: dict, output_path, symbols_dir,
         xs = [e[0] for e in ends] + [e[2] for e in ends]
         ys = [e[1] for e in ends] + [e[3] for e in ends]
         span = max(max(xs) - min(xs), max(ys) - min(ys))
-        label_route = (len(ends) == 2 and not needs_flag
-                       and (span >= LABEL_SPAN_MM
-                            or any(r in scrambled for r, _ in ok)))
+        label_route = (not needs_flag
+                       and ((len(ends) == 2 and span >= LABEL_SPAN_MM)
+                            or (len(ends) == 2
+                                and any(r in scrambled for r, _ in ok))
+                            or (len(ends) > 2
+                                and any(r in crystal_refs for r, _ in ok)
+                                and span >= LABEL_SPAN_MM)))
 
         net_jobs.append({"key": len(net_jobs), "name": name, "ends": ends,
                          "flag": None, "needs_flag": needs_flag,
@@ -1232,11 +1242,26 @@ def write_schematic(netlist: dict, bom: dict, output_path, symbols_dir,
     #  任何网络的引脚 stub（hard），那么同名标签只是把本可直连的线人为截断，
     #  视觉上就是一处「没必要断开」。这种情况恢复实线直连。真正要跨过排针、
     #  芯片或其它 stub 的仍保留标签，保持原规则防断线的初衷。
-    def _link_clear(a, b):
-        """两栅格点连成的水平/垂直段，除两端外是否无障碍（元件本体/异网 stub）。"""
-        for c in _cells_between(a, b)[1:-1]:
+    def _link_clear(a, b, key=None):
+        """两栅格点连成的水平/垂直段，除两端外是否无障碍。
+
+        除元件本体/异网 stub 外，还要检查已被其它网络**预留**的直连边/拐点：
+        直连路径在规划阶段就要互相避让，否则多条路径会共用同一段线，
+        KiCad 会把两个网络并成一个（PA9_TX/PA10_RX 就是这样串的）。
+        """
+        cells = _cells_between(a, b)
+        for c in cells[1:-1]:
             if c in blocked or c in hard:
                 return False
+            if key is not None:
+                users = vertex_owner.get(c)
+                if users and key not in users:
+                    return False
+        for p, q in zip(cells, cells[1:]):
+            if key is not None:
+                users = edge_owner.get(_edge_key(p, q))
+                if users and key not in users:
+                    return False
         return True
 
     def _straight_clear(job, key):
@@ -1252,14 +1277,17 @@ def write_schematic(netlist: dict, bom: dict, output_path, symbols_dir,
         a = _to_grid(job["ends"][0][2], job["ends"][0][3])   # stub 末端
         b = _to_grid(job["ends"][1][2], job["ends"][1][3])
         if a[0] == b[0] or a[1] == b[1]:                     # 同轴 → 直线
-            return [a, b] if _link_clear(a, b) else None
+            return [a, b] if _link_clear(a, b, key) else None
         # 不同轴 → 先试两条 L 型折线（先竖后横 / 先横后竖）
         for e in ((b[0], a[1]), (a[0], b[1])):
             if e == a or e == b:
                 continue
-            if not (_link_clear(a, e) and _link_clear(e, b)):
+            if not (_link_clear(a, e, key) and _link_clear(e, b, key)):
                 continue
             if e in blocked or e in hard:
+                continue
+            eu = vertex_owner.get(e)
+            if eu and key not in eu:
                 continue
             return [a, e, b]
         # L 型被密集引脚 stub 挡住 → 用 A* 在空隙里找路径，再压成折线。
@@ -1270,12 +1298,29 @@ def write_schematic(netlist: dict, bom: dict, output_path, symbols_dir,
             return p
         return None
 
+    def _reserve_direct(key, path):
+        """直连路径一经选中立即预留边/拐点，防止后选的直连复用同一段。"""
+        cells = []
+        for (x1, y1), (x2, y2) in _compress_segments(path):
+            a, b = _to_grid(x1, y1), _to_grid(x2, y2)
+            seg = _cells_between(a, b)
+            if not cells:
+                cells.extend(seg)
+            else:
+                cells.extend(seg[1:])
+            edge_owner.setdefault(_edge_key(a, b), set()).add(key)
+            vertex_owner.setdefault(a, set()).add(key)
+            vertex_owner.setdefault(b, set()).add(key)
+            for c in seg:
+                soft.setdefault(c, set()).add(key)
+
     for _job in net_jobs:
         _path = _straight_clear(_job, _job["key"]) if _job["label_route"] else None
         if _path is not None:
             _job["label_route"] = False
             _job["direct"] = True     # 无阻挡：跳过寻路，直接画直线/折线
             _job["direct_path"] = _path
+            _reserve_direct(_job["key"], _path)
 
     def _commit(key, path, fixed=False):
         if not fixed:
