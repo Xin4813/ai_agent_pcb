@@ -128,6 +128,36 @@ def _check_connector_function(items: list, by_ref: dict, pin_net: dict,
                           f"USB 无回流地，转串口/供电回路不成立")
         elif not _GND_RE.search(gnd_net):
             issues.append(f"USB 连接器 {ref} 的 GND 脚 {gnd_pin} 接在 {gnd_net} 而非 GND")
+    # 1b) ICSP 2×3 编程口：信号脚已接出、VCC/GND 却完全悬空。
+    #     连接器针脚悬空本身合法，ERC/视觉/安全都不报，但编程器插上后
+    #     无供电和回流地，烧录完全不可用。判据不绑定位号：6 针排针 +
+    #     至少两脚网名符合标准 ICSP 映射（1=MISO、3=SCK、4=MOSI、5=RESET）。
+    sig_re = re.compile(r"miso|mosi|(^|_)sck|reset|nrst|复位", re.I)
+    std = {"1": r"miso", "3": r"(^|_)sck", "4": r"mosi", "5": r"reset|nrst"}
+    for it in items:
+        sym = str(it.get("symbol", "")).lower()
+        if not ("conn_01x06" in sym or "conn_02x03" in sym):
+            continue
+        ref = it.get("ref", "")
+        attached = {}
+        for n in net_pins:
+            for r, pin in net_pins[n]:
+                if r == ref:
+                    attached[pin] = n
+        sig = {pn: nn for pn, nn in attached.items() if sig_re.search(nn)}
+        matched = sum(1 for pn, pat in std.items()
+                      if pn in sig and re.search(pat, sig[pn], re.I))
+        if matched < 2:
+            continue
+        checked += 1
+        for pn, label, pat in (("2", "VCC", r"vcc|vdd|\+?5v"),
+                               ("6", "GND", r"gnd|vss|地")):
+            nn = pin_net.get((ref, pn))
+            if nn is None:
+                issues.append(f"ICSP 编程排针 {ref} 的 {pn} 脚({label})悬空——"
+                              f"编程器无供电/回流地，无法烧录")
+            elif not re.search(pat, nn, re.I):
+                issues.append(f"ICSP 编程排针 {ref} 的 {pn} 脚({label})接在 {nn} 而非 {label}")
     # 2) SWD 信号未引出
     swd_nets = {
         "SWDIO": [n for n in net_pins if re.search(r"swdio|swdat|jtms", n, re.I)],

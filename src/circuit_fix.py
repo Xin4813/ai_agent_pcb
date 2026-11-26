@@ -3203,6 +3203,88 @@ def _break_out_missing_io_ports(items, ops, lib, fixes: list[str]) -> None:
                 f"新增 {jref}（{count}Pin）并逐脚连接到 {prefix}0…{prefix}{entries[-1][0]}")
 
 
+def _mcu_supply_net(ops, items, lib) -> str | None:
+    """主控实际所在的供电网名（不看网名先不看芯片脚，避免 VCC_IO 这类假电源）。"""
+    for it in items:
+        if not _is_mcu_item(it):
+            continue
+        for wanted in ("VCC", "VDD"):
+            for p in _p(it, lib, wanted):
+                nn = ops.name(f"{it['ref']}:{p}")
+                if nn and len(ops.members(nn)) > 1:
+                    return nn
+    v33 = _v33_net(ops, items, lib)
+    if v33:
+        return v33
+    for net in ops.nets:
+        if _SUPPLY_RE.search(str(net.get("name") or "")) and len(net["pins"]) > 1:
+            return net["name"]
+    return None
+
+
+def _fix_icsp_power_pins(items, ops, lib, fixes: list[str]) -> None:
+    """2×3 ICSP 编程口只接出信号脚、VCC/GND 脚悬空时补接电源与地。
+
+    LLM 常把 ICSP 的 MISO/MOSI/SCK/RESET 四根信号写完，却把 2 脚(VCC)、
+    6 脚(GND)整个漏掉：网表里根本没有这两个引脚，writer 按规范打
+    no_connect（×）。ERC 0、视觉 0、功能自检 0（连接器针脚允许悬空），
+    但编程器插上后没有供电和回流地，烧录完全不可用。
+
+    判据不绑定位号：6 针连接器 + 至少两脚网名符合标准 2×3 ICSP 引脚映射
+    （1=MISO、3=SCK、4=MOSI、5=RESET）或标注含 ICSP/编程。引脚号优先取
+    符号里的 VCC/GND 引脚名，取不到才用 ICSP 标准排列。只在引脚完全悬空
+    （或只挂一个同义单脚网）时补，已接到其它网的不动，保证幂等。
+    """
+    sig_re = re.compile(r"miso|mosi|(^|_)sck|reset|nrst|复位", re.I)
+    std = {"1": r"miso", "3": r"(^|_)sck", "4": r"mosi", "5": r"reset|nrst"}
+    for it in items:
+        sym = str(it.get("symbol", "")).lower()
+        if not ("conn_01x06" in sym or "conn_02x03" in sym):
+            continue
+        ref = it["ref"]
+        ident = f"{it.get('name','')} {it.get('desc','')} {it.get('value','')}"
+        attached: dict[str, str] = {}
+        for net in ops.nets:
+            for p in net["pins"]:
+                if p.startswith(ref + ":"):
+                    attached[p.partition(":")[2]] = str(net.get("name") or "")
+        sig = {pn: nn for pn, nn in attached.items() if sig_re.search(nn)}
+        matched = sum(1 for pn, pat in std.items()
+                      if pn in sig and re.search(pat, sig[pn], re.I))
+        if matched < 2 and not re.search(r"icsp|isp|编程|program", ident, re.I):
+            continue
+        vcc_pin = gnd_pin = None
+        if lib:
+            try:
+                for num, nm in lib.pin_names(it["symbol"]).items():
+                    if re.search(r"vcc|vdd|\+?5v", str(nm), re.I):
+                        vcc_pin = str(num)
+                    elif _GND_RE.search(str(nm)):
+                        gnd_pin = str(num)
+            except Exception:
+                pass
+        vcc_pin = vcc_pin or "2"           # 标准 2×3 ICSP：2=VCC，6=GND
+        gnd_pin = gnd_pin or "6"
+        vcc = _mcu_supply_net(ops, items, lib)
+        gnd = _gnd_net(ops)
+        for pin, target, label, sem in (
+            (vcc_pin, vcc, "VCC", _SUPPLY_RE),
+            (gnd_pin, gnd, "GND", _GND_RE),
+        ):
+            if not target:
+                continue
+            full = f"{ref}:{pin}"
+            cur = ops.name(full)
+            if cur == target:
+                continue
+            # 只补完全悬空、或只挂在同义单脚网上的脚； intentional 连接不动
+            if cur and not (len(ops.members(cur)) == 1 and sem.search(cur)):
+                continue
+            ops.attach(full, target)
+            fixes.append(f"ICSP 编程排针 {ref} 的 {pin} 脚({label})原悬空，"
+                         f"已接 {target}（否则编程器无供电/回流地，无法烧录）")
+
+
 def _fix_usb_connector_ground(items, ops, lib, fixes: list[str]) -> None:
     """接了 USB D± 的连接器，GND 脚必须真的接到 GND 网。
 
@@ -3385,6 +3467,7 @@ def fix_topology(bom: dict, netlist: dict, symbol_lib=None) -> list[str]:
     _fix_uart_missing_link(items, ops, symbol_lib, fixes)  # TXD/RXD 整对漏接→补到 MCU USART 脚
     _fix_uart_txrx_cross(items, ops, symbol_lib, fixes)  # TXD/RXD 与 MCU TX/RX 直连→对调
     _fix_usb_connector_ground(items, ops, symbol_lib, fixes)  # USB 口 GND 悬空 → 补地
+    _fix_icsp_power_pins(items, ops, symbol_lib, fixes)  # ICSP 编程口 VCC/GND 悬空 → 补电源/地
     _fix_swd_breakout(items, ops, symbol_lib, fixes)  # SWD 信号只挂单脚 → 加排针引出
     _break_out_missing_io_ports(items, ops, symbol_lib, fixes)  # 整组 IO 漏接 → 加排针逐脚引出
     ops.drop_empty()
