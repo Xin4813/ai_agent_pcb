@@ -290,18 +290,18 @@ def _shorten_path(path, blocked, soft, hard, key, edges=None, vertices=None):
             if edge_users and key not in edge_users:
                 return False
         for c in cells:
-            if c in (a, b):
-                continue
-            if c in blocked:                      # 符号本体不可穿
+            # 端点只豁免符号本体：若它与异网的拐点/端点重合，KiCad 会把
+            # 两段接成一条线并串网，短缩时同样必须拒绝。
+            if c not in (a, b) and c in blocked:
                 return False
             hard_users = hard.get(c)
-            if hard_users and key not in hard_users:   # 别人的端点不可穿
+            if hard_users and key not in hard_users:
                 return False
             vertex_users = vertices.get(c)
             if vertex_users and key not in vertex_users:
                 return False
             users = soft.get(c)
-            if users and users != {key}:          # 别人的线：短缩不越过
+            if c not in (a, b) and users and users != {key}:
                 return False
         return True
 
@@ -346,9 +346,7 @@ def _straighten_steps(path, blocked, soft, hard, key, edges=None, vertices=None)
             if edge_users and key not in edge_users:
                 return False
         for c in cells:
-            if c in (a, b):
-                continue
-            if c in blocked:
+            if c not in (a, b) and c in blocked:
                 return False
             hu = hard.get(c)
             if hu and key not in hu:
@@ -357,7 +355,7 @@ def _straighten_steps(path, blocked, soft, hard, key, edges=None, vertices=None)
             if vu and key not in vu:
                 return False
             u = soft.get(c)
-            if u and u != {key}:
+            if c not in (a, b) and u and u != {key}:
                 return False
         return True
 
@@ -651,49 +649,90 @@ def _align_connector_buses(items, lib, netlist, positions, alias, paper):
     occupied = []   # (x0,x1,y0,y1) 已规划的排针占位（含间距）
     new_pos = dict(positions)
     mirrored = set()
-    col_x = bus_x
+    sym_by_ref = {it["ref"]: it["symbol"] for it in items}
+
     def body_half(ref):
         """元件本体半宽/半高（引脚实际范围 + 小缓冲，不含文字 MARGIN）。"""
         ps = pins_of[ref].values()
         return (max((abs(p[0]) for p in ps), default=5) + 2.0,
                 max((abs(p[1]) for p in ps), default=5) + 2.0)
 
+    def text_extent(ref):
+        """非总线元件的「本体 + Reference/Value」占位。
+
+        过去只按引脚包围盒避让，短脚器件（按键、跳线）本体很小，但它的
+        属性文字按 MARGIN 被推到离本体十几毫米处，正好落进对齐后排针的
+        文字列（SW1/J1 的 Reference 贴在一起）。这里把文字也算进障碍，
+        让排针自动换到相邻列，而不是把别人的文字压住。
+        """
+        ox, oy = positions[ref]
+        hw, hh = body_half(ref)
+        by_ref = next((it for it in items if it["ref"] == ref), {})
+        tw = max([len(str(by_ref.get("value", ""))), len(ref), 1]) * 1.27 / 2
+        return (max(hw, tw + 0.635), hh + MARGIN + 2.54 + 0.635)
+
     for plan in plans:
         ref = plan["ref"]
-        cpins = pins_of[ref]
         hw, hh = body_half(ref)
         y0, y1 = plan["y0"] - 2, plan["y1"] + 2
-        placed = False
-        for try_x in (col_x, col_x + 22.86, col_x + 45.72, col_x + 68.58):
+        # 对齐后的排针统一镜像朝芯片，引线（STUB）从引脚继续向左伸出。
+        # 只在左侧计入这段 reach：左右都加会把排针本身也撑大，密集板上
+        # 找不到任何列，反而整组退化为默认布局（a20aaa87 的 J4 曾这样
+        # 导致 PWR_FLAG 悬空）。82faa274 的 J2 穿 U2 正是左侧 reach 漏算。
+        stub_left = STUB if str(sym_by_ref.get(ref, "")).startswith("Connector:") else 0.0
+        # 备用列多留两档：密集板上前四列可能都被文字/相邻排针占满，
+        # 此时宁可继续右移，也不要放弃对齐退回默认位置（会让 PWR_FLAG
+        # 和长总线失去规划好的通道）。
+        for try_x in (bus_x, bus_x + 22.86, bus_x + 45.72,
+                      bus_x + 68.58, bus_x + 91.44, bus_x + 114.3,
+                      bus_x + 137.16, bus_x + 160.02, bus_x + 182.88):
             tx0, tx1 = try_x - hw - 1, try_x + hw + 1
             # 与其它已摆排针冲突 → 试下一列
             if any(not (tx1 < o[0] or tx0 > o[1] or y1 < o[2] or y0 > o[3])
                    for o in occupied):
                 continue
-            # 与未参与总线的元件冲突 → 放弃该排针对齐（保守）
+            # 与未参与总线的元件（含其属性文字）冲突 → 试下一列
             clash = False
             for it in items:
                 r = it["ref"]
                 if r == ref or r in bus:
                     continue
                 ox, oy = positions[r]
-                ohw, ohh = body_half(r)
-                if not (tx1 < ox - ohw or tx0 > ox + ohw
-                        or y1 < oy - ohh or y0 > oy + ohh):
+                ohw, ohh = text_extent(r)
+                # 只把「实质重叠」当冲突：text_extent 保守地包住了
+                # Reference/Value 两行，密集板上与长排针经常只擦到半格，
+                # 若一律避让会把排针挤到没有任何候选列（a20aaa87 的 J4）。
+                overlap_x = min(tx1, ox + ohw) - max(tx0, ox - ohw)
+                overlap_y = min(y1, oy + ohh) - max(y0, oy - ohh)
+                if overlap_x > 2 * GRID and overlap_y > 2 * GRID:
                     clash = True
                     break
             if clash:
                 continue
+            # stub reach 单独按「符号本体」做零容差检查：文字擦边可以容忍
+            # 一格，但连接器的 7.62mm 引线只要碰到别的芯片引脚区就会把
+            # 异网 stub 并到一起（219c3adc 的 J3↔U2 就是一格擦边串网）。
+            if stub_left:
+                sx0, sx1 = tx0 - STUB, tx0
+                for it in items:
+                    r = it["ref"]
+                    if r == ref or r in bus:
+                        continue
+                    ox, oy = positions[r]
+                    ohw, ohh = body_half(r)
+                    if (min(sx1, ox + ohw) - max(sx0, ox - ohw) > 0.01
+                            and min(y1, oy + ohh) - max(y0, oy - ohh) > 0.01):
+                        clash = True
+                        break
+                if clash:
+                    continue
             pw, ph = PAPERS[paper]
             if try_x + hw > pw - PAGE_MX or _in_title_block(try_x, plan["y"], hw, hh, paper):
                 continue
             new_pos[ref] = (_snap(try_x), _snap(plan["y"]))
             mirrored.add(ref)
             occupied.append((tx0, tx1, y0, y1))
-            placed = True
             break
-        if placed:
-            col_x = max(col_x, try_x)   # 后续排针优先同列，重叠才右移
     return new_pos, mirrored, scrambled
 
 
@@ -799,12 +838,71 @@ def write_schematic(netlist: dict, bom: dict, output_path, symbols_dir,
         cols.setdefault(_find(i), []).append(p)
     for col in cols.values():
         col.sort(key=lambda p: p["y"])
+        # 自下而上：上面的文字给下面的让位。
         for i in range(len(col) - 1, -1, -1):
             col[i]["y"] = min(col[i]["y"], y_ceil)
             if i < len(col) - 1:
                 col[i]["y"] = min(col[i]["y"],
                                   col[i + 1]["y"] - MIN_PROP_PITCH)
             col[i]["y"] = max(col[i]["y"], y_floor)
+        # 自上而下：被页面上沿挡住、退无可退时，改为把下面的文字压下去。
+        # 旧版只做前半段，SW1/J1 两行都被夹到 y=22 附近仍互压。
+        for i in range(1, len(col)):
+            col[i]["y"] = max(col[i]["y"], col[i - 1]["y"] + MIN_PROP_PITCH)
+            col[i]["y"] = min(col[i]["y"], y_ceil)
+        for i in range(len(col) - 2, -1, -1):
+            col[i]["y"] = min(col[i]["y"], col[i + 1]["y"] - MIN_PROP_PITCH)
+            col[i]["y"] = max(col[i]["y"], y_floor)
+
+    # 属性文字还要避开所有元件的固定引脚引出线。过去只做文字互避，
+    # 相邻元件的 stub 会直接穿过宽 Value（a20aaa87 的 PB0-PB15 被 R2
+    # 竖线穿过）；走线阶段无法移动 stub，只能在这里把文字挪开。
+    stub_segments = []
+    for it in items:
+        ref = it["ref"]
+        ix, iy = positions[ref]
+        _, pins = pin_cache[ref]
+        for px, py, ang in pins.values():
+            ax, ay, dx, dy = _pin_abs(px, py, ang, ix, iy, ref in mirrored)
+            stub_segments.append((ax, ay, ax - dx * STUB, ay + dy * STUB))
+
+    def _stub_hits_text(p, ty):
+        half_h = 0.635
+        x0, x1 = p["x"] - p["hw"], p["x"] + p["hw"]
+        y0, y1 = ty - half_h, ty + half_h
+        inset = 0.35
+        for ax, ay, bx, by in stub_segments:
+            if abs(ay - by) < 1e-6:
+                if (y0 + inset < ay < y1 - inset
+                        and max(ax, bx) > x0 + inset
+                        and min(ax, bx) < x1 - inset):
+                    return True
+            elif abs(ax - bx) < 1e-6:
+                if (x0 + inset < ax < x1 - inset
+                        and max(ay, by) > y0 + inset
+                        and min(ay, by) < y1 - inset):
+                    return True
+        return False
+
+    for p in prop_texts:
+        if not _stub_hits_text(p, p["y"]):
+            continue
+        moved = None
+        for step in range(1, 13):
+            for ny in (p["y"] + step * GRID, p["y"] - step * GRID):
+                if not (y_floor <= ny <= y_ceil) or _stub_hits_text(p, ny):
+                    continue
+                if any(q is not p
+                       and abs(p["x"] - q["x"]) < p["hw"] + q["hw"]
+                       and abs(ny - q["y"]) < MIN_PROP_PITCH
+                       for q in prop_texts):
+                    continue
+                moved = ny
+                break
+            if moved is not None:
+                break
+        if moved is not None:
+            p["y"] = moved
 
     property_cells = set()
     for p in prop_texts:
@@ -1026,6 +1124,7 @@ def write_schematic(netlist: dict, bom: dict, output_path, symbols_dir,
                          "flag": None, "needs_flag": needs_flag,
                          "touched": set(),
                          "label_route": label_route, "span": span,
+                         "scrambled": any(r in scrambled for r, _k in ok),
                          "refs": {r for r, _k in ok}})
 
     # ② PWR_FLAG 位置：所有网络的引出线都收集完后统一排布。
@@ -1162,7 +1261,10 @@ def write_schematic(netlist: dict, bom: dict, output_path, symbols_dir,
             ga, gb = _to_grid(ax, ay), _to_grid(ex, ey)
             sdx = (ga[0] > gb[0]) - (ga[0] < gb[0])
             sdy = (ga[1] > gb[1]) - (ga[1] < gb[1])
-            max_step = min(3, abs(ga[0] - gb[0]) + abs(ga[1] - gb[1]))
+            # 允许沿整条 stub 找安全锚点：部分连接器的 7.62mm 引出线会
+            # 伸进相邻芯片本体，旧版只退 3 格，找不到合法位置只能把标签
+            # 留在芯片里，导线随之内穿。文字占位检查会挡住落进本体的候选。
+            max_step = abs(ga[0] - gb[0]) + abs(ga[1] - gb[1])
             chosen = None
             for k in range(max_step + 1):
                 cell = (gb[0] + sdx * k, gb[1] + sdy * k)
@@ -1228,10 +1330,13 @@ def write_schematic(netlist: dict, bom: dict, output_path, symbols_dir,
             hard.setdefault(fc, set()).add(key)
             vertex_owner.setdefault(fc, set()).add(key)
 
-    # 元件文字与网络标签统一作为“视觉软障碍”登记：走线能绕则绕，绕不开
-    # 仍可穿越（保连通）。-1 是图形占位哨兵，不属于任何真实网络。
+    # 元件文字是硬障碍：过去只当软障碍，密集区 A* 会直接穿过 Value
+    # （STM32F103C8T6、USB-Micro-B、22pF 等反复被导线穿字）。网络标签
+    # 仍保持软障碍，因为它本来就贴在自己宿主导线上。
+    # -1 是图形占位哨兵，不属于任何真实网络。
     for c in property_cells:
         soft.setdefault(c, set()).add(-1)
+        hard.setdefault(c, set()).add(-1)
     for _plan in label_plan.values():
         for c in _plan[3]:
             soft.setdefault(c, set()).add(-1)
@@ -1250,8 +1355,11 @@ def write_schematic(netlist: dict, bom: dict, output_path, symbols_dir,
         KiCad 会把两个网络并成一个（PA9_TX/PA10_RX 就是这样串的）。
         """
         cells = _cells_between(a, b)
-        for c in cells[1:-1]:
-            if c in blocked or c in hard:
+        # 端点也要查 vertex_owner：两条直连线若在同一点收口，即使各自只
+        # 检查「中间格」，KiCad 仍会把相邻/共线的两段当成一条线并串网
+        # （04d7bbde 的 PA10_RX/PA13_SWDIO 就是这么撞上的）。
+        for c in cells:
+            if c not in (a, b) and (c in blocked or c in hard):
                 return False
             if key is not None:
                 users = vertex_owner.get(c)
@@ -1315,7 +1423,10 @@ def write_schematic(netlist: dict, bom: dict, output_path, symbols_dir,
                 soft.setdefault(c, set()).add(key)
 
     for _job in net_jobs:
-        _path = _straight_clear(_job, _job["key"]) if _job["label_route"] else None
+        # 混合排针的标签化是为避开密脚阶梯折线而做的整体决策：这里不能再
+        # 把其中「看似无阻挡」的两脚网恢复成实线，否则又变回一片折线。
+        can_direct = _job["label_route"] and not _job["scrambled"]
+        _path = _straight_clear(_job, _job["key"]) if can_direct else None
         if _path is not None:
             _job["label_route"] = False
             _job["direct"] = True     # 无阻挡：跳过寻路，直接画直线/折线
@@ -1496,6 +1607,7 @@ def write_schematic(netlist: dict, bom: dict, output_path, symbols_dir,
                 vertex_owner.setdefault(fc, set()).add(key)
         for c in property_cells:
             soft.setdefault(c, set()).add(-1)
+            hard.setdefault(c, set()).add(-1)
         for plan in label_plan.values():
             for c in plan[3]:
                 soft.setdefault(c, set()).add(-1)
@@ -1539,6 +1651,13 @@ def write_schematic(netlist: dict, bom: dict, output_path, symbols_dir,
             else:
                 _restore_wires(snapshot)
                 job["touched"] = touched_before
+                # 回退时必须先删掉本次重布新增的收口点，再恢复旧值。
+                # 过去只 update，重布新加的 key 会残留：导线已回滚到原
+                # 落点，stub 却按新收口点画出，末端悬空被裁剪，最终 ERC
+                # 报「引脚未连接」（fb1d04c0 的 C4:2 就是这样断的）。
+                for k in list(stub_trim):
+                    if k[0] == victim:
+                        del stub_trim[k]
                 stub_trim.update(trim_before)
         if not progressed:
             break
@@ -1756,6 +1875,14 @@ def write_schematic(netlist: dict, bom: dict, output_path, symbols_dir,
                         or _in_title_block(x, y, hw, _TEXT_H / 2, paper):
                     continue
                 for a in (lab["orig"], 90):
+                    # 自由平移候选绝不能落进符号本体/引脚红线区。过去只
+                    # 查页面和标题栏，密集区会把标签挪进相邻芯片本体，
+                    # 引出线跟着横穿芯片（82faa274 的 J2↔U1 标签就是
+                    # 这样压到 U2 上的）。初始 label_plan 已避开 blocked，
+                    # 二次避让也必须遵守同一约束。
+                    _tc = _text_cells(cell, lab["text"], a)
+                    if any(c in blocked for c in _tc):
+                        continue
                     cand = (cell, a)
                     if cand not in lab["cands"]:
                         lab["cands"].append(cand)
@@ -1789,11 +1916,16 @@ def write_schematic(netlist: dict, bom: dict, output_path, symbols_dir,
             if job["label_route"] and (key, i) in final_label_plan:
                 lxp, lyp = final_label_plan[(key, i)][:2]
                 ax0, ay0 = job["ends"][i][0], job["ends"][i][1]
-                far_x = abs(lxp - ax0) > abs(tex - ax0) + 0.01
-                far_y = abs(lyp - ay0) > abs(tey - ay0) + 0.01
-                if (far_x and abs(ay0 - tex) < 0.01 and abs(ay0 - lyp) < 0.01) \
-                        or (far_y and abs(ax0 - tey) < 0.01 and abs(ax0 - lxp) < 0.01):
-                    tex, tey = lxp, lyp
+                EPS = 1e-6
+                # 水平 stub：标签若比原末端更远则延长，若退到引脚与原末端
+                # 之间则同步缩短，避免标签仍在导线上、导线却多伸进相邻本体。
+                if abs(ay0 - tex) < EPS and abs(ay0 - lyp) < EPS:
+                    if min(ax0, tex) - EPS <= lxp <= max(ax0, tex) + EPS:
+                        tex, tey = lxp, lyp
+                # 垂直 stub 同理。
+                elif abs(ax0 - tey) < EPS and abs(ax0 - lxp) < EPS:
+                    if min(ay0, tey) - EPS <= lyp <= max(ay0, tey) + EPS:
+                        tex, tey = lxp, lyp
             # stub 中途若有同网导线接入，收口到最靠引脚的接入点
             tap = _stub_early_tap(ax, ay, tex, tey, key)
             if tap is not None:
