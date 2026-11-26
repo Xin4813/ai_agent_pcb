@@ -1311,7 +1311,9 @@ def write_schematic(netlist: dict, bom: dict, output_path, symbols_dir,
                     for a, b in _mst_edges(pts))
         return (-len(pts), total, kv[0])
 
-    for key, job in sorted(enumerate(net_jobs), key=_order):
+    route_order = {}
+    for order, (key, job) in enumerate(sorted(enumerate(net_jobs), key=_order)):
+        route_order[key] = order
         # 长距离点对点信号：两端各留短 stub + 同名全局标签即可，
         # 不画横穿全图的长导线（图面清爽、风格统一、不会绕不开而断线）。
         if job["label_route"]:
@@ -1320,6 +1322,105 @@ def write_schematic(netlist: dict, bom: dict, output_path, symbols_dir,
         if job["flag"]:
             pts.append(_to_grid(job["flag"][0], job["flag"][1]))
         _mst_route(key, job, pts)
+
+    # ⑥-pre 交叉回退重布：先布的网络当时看不到后布的线，可能留下本可绕开的
+    # 十字交叉。这里只处理「中段穿中段」的异网交叉：拆掉先布那条网的已布
+    # 导线，在其它网已固定的基础上重布一次；交叉数没减少就整体回滚。
+    # 端点相交（T 接点）不动，避免破坏 KiCad 的同网合并规则。
+    def _cross_list():
+        out = []
+        for i, wv in enumerate(wire_buffer):
+            vx1, vy1, vx2, vy2, kv = wv
+            if abs(vx1 - vx2) > 1e-6 or abs(vy1 - vy2) < 1e-6:
+                continue                      # 只找竖线
+            vx, ya, yb = vx1, min(vy1, vy2), max(vy1, vy2)
+            for j, wh in enumerate(wire_buffer):
+                hx1, hy1, hx2, hy2, kh = wh
+                if kh == kv:
+                    continue
+                if abs(hy1 - hy2) > 1e-6 or abs(hx1 - hx2) < 1e-6:
+                    continue                  # 只找横线
+                hy, xa, xb = hy1, min(hx1, hx2), max(hx1, hx2)
+                if xa + 1e-6 < vx < xb - 1e-6 and ya + 1e-6 < hy < yb - 1e-6:
+                    out.append((i, j, vx, hy, kv, kh))
+        return out
+
+    def _restore_wires(snapshot):
+        wire_buffer[:] = snapshot
+        wire_segments[:] = snapshot
+        wire_seen.clear()
+        for x1, y1, x2, y2, k in snapshot:
+            a, b = (round(x1, 3), round(y1, 3)), (round(x2, 3), round(y2, 3))
+            wire_seen.add((tuple(sorted((a, b))), k))
+
+    def _rebuild_occupancy():
+        soft.clear()
+        hard.clear()
+        edge_owner.clear()
+        vertex_owner.clear()
+        for key, job in enumerate(net_jobs):
+            for e in job["ends"]:
+                ga, gb = _to_grid(e[0], e[1]), _to_grid(e[2], e[3])
+                _occupy(key, ga, gb)
+                for c in _cells_between(ga, gb):
+                    hard.setdefault(c, set()).add(key)
+                edge_owner.setdefault(_edge_key(ga, gb), set()).add(key)
+                vertex_owner.setdefault(ga, set()).add(key)
+                vertex_owner.setdefault(gb, set()).add(key)
+            if job["flag"]:
+                fc = _to_grid(job["flag"][0], job["flag"][1])
+                soft.setdefault(fc, set()).add(key)
+                hard.setdefault(fc, set()).add(key)
+                vertex_owner.setdefault(fc, set()).add(key)
+        for c in property_cells:
+            soft.setdefault(c, set()).add(-1)
+        for plan in label_plan.values():
+            for c in plan[3]:
+                soft.setdefault(c, set()).add(-1)
+        for x1, y1, x2, y2, k in wire_buffer:
+            ga, gb = _to_grid(x1, y1), _to_grid(x2, y2)
+            _occupy(k, ga, gb)
+            edge_owner.setdefault(_edge_key(ga, gb), set()).add(k)
+            vertex_owner.setdefault(ga, set()).add(k)
+            vertex_owner.setdefault(gb, set()).add(k)
+
+    for _pass in range(3):
+        crosses = _cross_list()
+        if not crosses:
+            break
+        tried = set()
+        progressed = False
+        for _i, _j, _vx, _hy, kv, kh in crosses:
+            victim = kv if route_order.get(kv, 10 ** 9) <= route_order.get(kh, 10 ** 9) else kh
+            if victim in tried:
+                continue
+            tried.add(victim)
+            before = len(_cross_list())
+            snapshot = list(wire_buffer)
+            touched_before = set(net_jobs[victim]["touched"])
+            trim_before = {k: v for k, v in stub_trim.items() if k[0] == victim}
+            _restore_wires([w for w in snapshot if w[4] != victim])
+            _rebuild_occupancy()
+            job = net_jobs[victim]
+            job["touched"] = set()
+            for k in list(stub_trim):
+                if k[0] == victim:
+                    del stub_trim[k]
+            pts = [_to_grid(e[2], e[3]) for e in job["ends"]]
+            if job["flag"]:
+                pts.append(_to_grid(job["flag"][0], job["flag"][1]))
+            _mst_route(victim, job, pts)
+            after = len(_cross_list())
+            has_wires = any(w[4] == victim for w in wire_buffer)
+            if after < before and has_wires:
+                progressed = True
+            else:
+                _restore_wires(snapshot)
+                job["touched"] = touched_before
+                stub_trim.update(trim_before)
+        if not progressed:
+            break
+    _rebuild_occupancy()
 
     # ⑥ 输出引出线、标签和 PWR_FLAG。
     # 已用导线连通的网络只挂一个标签；未接通的端点保留标签兜底。
