@@ -38,6 +38,8 @@ GRID = 1.27          # KiCad 默认栅格 50 mil
 #  rationale：跨越大半个芯片/排针的长导线既容易绕不开、退化成两端小标签的
 # 「视觉断线」，又让图面拥挤。主动统一改用带方框的全局标签（一眼可辨是同名
 # 端口连接），图面清爽且风格一致。仅限 2 端点、非电源的网络；多端点网仍走实线。
+# 例外（见布线前 _straight_clear 回退）：两端同轴且整段无阻挡时，同名标签
+# 反而制造本可避免的「视觉断线」，此时恢复实线直连。
 LABEL_SPAN_MM = 35.0
 STUB = 7.62          # 引脚引出线长度（6mm：引出点在符号体外，短线+标签即可；
                      # 且 |引脚偏移|+7.62 ≤ 包围盒半高(=|引脚偏移|+12)，导线永远
@@ -1210,6 +1212,29 @@ def write_schematic(netlist: dict, bom: dict, output_path, symbols_dir,
         for c in _plan[3]:
             soft.setdefault(c, set()).add(-1)
 
+    # ⑥-pre2 同轴无阻挡的长点对点网恢复实线直连（通用规则，不按网名/位号特判）。
+    #  长距离两脚信号默认用两端同名标签，避免长线绕不开而断线。但若两端 stub
+    #  末端恰好同轴、且中间整段既没有元件本体/旗标/标题栏（blocked），也没有
+    #  任何网络的引脚 stub（hard），那么同名标签只是把本可直连的线人为截断，
+    #  视觉上就是一处「没必要断开」。这种情况恢复实线直连。真正要跨过排针、
+    #  芯片或其它 stub 的仍保留标签，保持原规则防断线的初衷。
+    def _straight_clear(job):
+        if len(job["ends"]) != 2 or job["span"] < LABEL_SPAN_MM:
+            return False
+        a = _to_grid(job["ends"][0][2], job["ends"][0][3])   # stub 末端
+        b = _to_grid(job["ends"][1][2], job["ends"][1][3])
+        if a[0] != b[0] and a[1] != b[1]:
+            return False                                     # 不同轴 → 走标签
+        for c in _cells_between(a, b)[1:-1]:                # 中间段，不含两端
+            if c in blocked or c in hard:
+                return False
+        return True
+
+    for _job in net_jobs:
+        if _job["label_route"] and _straight_clear(_job):
+            _job["label_route"] = False
+            _job["direct"] = True     # 同轴无阻挡：跳过寻路，直接画直线
+
     def _commit(key, path):
         path = _shorten_path(path, blocked, soft, hard, key,
                              edge_owner, vertex_owner)
@@ -1302,14 +1327,15 @@ def write_schematic(netlist: dict, bom: dict, output_path, symbols_dir,
             if len(path) >= 2:
                 _commit(key, path)
 
-    # 布线顺序：端点多的网络先走、同等规模下总长度短的优先。
-    # 实测大网（VCC/GND）先占好主干，小网绕行，比小网先走少几处交叉。
+    # 布线顺序：同轴直连线（路径刚性）先占住直线，其余网络端点多的先走、
+    # 同等规模下总长度短的优先。实测大网（VCC/GND）先占好主干、小网绕行，
+    # 比小网先走少几处交叉。
     def _order(kv):
         job = kv[1]
         pts = [_to_grid(e[2], e[3]) for e in job["ends"]]
         total = sum(abs(pts[a][0] - pts[b][0]) + abs(pts[a][1] - pts[b][1])
                     for a, b in _mst_edges(pts))
-        return (-len(pts), total, kv[0])
+        return (0 if job.get("direct") else 1, -len(pts), total, kv[0])
 
     route_order = {}
     for order, (key, job) in enumerate(sorted(enumerate(net_jobs), key=_order)):
@@ -1321,7 +1347,15 @@ def write_schematic(netlist: dict, bom: dict, output_path, symbols_dir,
         pts = [_to_grid(e[2], e[3]) for e in job["ends"]]
         if job["flag"]:
             pts.append(_to_grid(job["flag"][0], job["flag"][1]))
-        _mst_route(key, job, pts)
+        if job.get("direct"):
+            # 同轴无阻挡：两端 stub 末端直接连一条直线。不走 _route_path，
+            # 因为端点标签已作为 soft 占位，寻路的 cross_penalty 会把直线
+            # 逼得折一格。_commit 对两点路径原样保留并登记 soft/edge/vertex，
+            # 后续网络会绕开这条直线，不会引入新交叉。
+            job["touched"].update((0, 1))
+            _commit(key, pts[:2])
+        else:
+            _mst_route(key, job, pts)
 
     # ⑥-pre 交叉回退重布：先布的网络当时看不到后布的线，可能留下本可绕开的
     # 十字交叉。这里只处理「中段穿中段」的异网交叉：拆掉先布那条网的已布
