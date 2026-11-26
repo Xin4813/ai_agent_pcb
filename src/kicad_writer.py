@@ -556,8 +556,9 @@ def _align_connector_buses(items, lib, netlist, positions, alias, paper):
     仅当排针与芯片之间存在足够多（≥3）的一一对应信号脚时才对齐；
     且目标位置不得与其它元件/标题栏冲突。任何不确定都保持原布局。
 
-    返回 (新 positions, 需要镜像的位号集合)。
+    返回 (新 positions, 需要镜像的位号集合, 混合排针位号集合)。
     """
+    scrambled = set()   # 每次调用独立，避免跨会话残留
     by_ref = {it["ref"]: it for it in items}
     pins_of = {}
     for it in items:
@@ -570,7 +571,7 @@ def _align_connector_buses(items, lib, netlist, positions, alias, paper):
     anchor = max((r for r in pins_of if pins_of[r]),
                  key=lambda r: (len(pins_of[r]), r), default=None)
     if not anchor:
-        return positions, set()
+        return positions, set(), scrambled
     ax, ay = positions[anchor]
 
     def resolve(ref):
@@ -603,7 +604,7 @@ def _align_connector_buses(items, lib, netlist, positions, alias, paper):
             bus[ref] = pairs
 
     if not bus:
-        return positions, set()
+        return positions, set(), scrambled
 
     # 芯片右侧边界（引脚最大 x），排针放到其右侧一列。
     # 需要有足够间距让两侧引出线（各 STUB=7.62）错开：若太近，芯片脚与
@@ -629,6 +630,17 @@ def _align_connector_buses(items, lib, netlist, positions, alias, paper):
         if not targets:
             continue
         targets.sort()
+        # 通用的「混合排针」识别：各脚期望中心 y 相差很大（>3 脚距）
+        # 且脚号→芯片脚映射来回折返 ≥2 次，说明这不是整齐并行总线，
+        # 而是 ICSP+数据+AREF 这类混合排针。强行镜像对齐会让 A* 在密脚
+        # 间画出成片阶梯折线；这类排针的两脚网改走两端同名标签，清爽且
+        # 电气等价。单调映射（哪怕跨度大）仍走原来的实线对齐，保持既有
+        # 的总线整洁效果。
+        seq = [pairs[k] for k in sorted(pairs)]
+        dirs = [(b > a) - (b < a) for a, b in zip(seq, seq[1:])]
+        reversals = sum(1 for a, b in zip(dirs, dirs[1:]) if a != b)
+        if targets[-1] - targets[0] > 2.54 * 3 and reversals >= 2:
+            scrambled.add(ref)
         cy = _snap(targets[len(targets) // 2])
         ys = [cy - cpins[p][1] for p in pairs if p in cpins]
         plans.append({"ref": ref, "y": cy, "y0": min(ys), "y1": max(ys),
@@ -682,7 +694,7 @@ def _align_connector_buses(items, lib, netlist, positions, alias, paper):
             break
         if placed:
             col_x = max(col_x, try_x)   # 后续排针优先同列，重叠才右移
-    return new_pos, mirrored
+    return new_pos, mirrored, scrambled
 
 
 def write_schematic(netlist: dict, bom: dict, output_path, symbols_dir,
@@ -698,8 +710,9 @@ def write_schematic(netlist: dict, bom: dict, output_path, symbols_dir,
     items, alias = _expand_refs(bom["items"])
     positions, paper = _layout(items, lib, netlist, alias)
     auto_mirror = set()
+    scrambled = set()
     if auto_bus and not layout_override and not mirror_override:
-        positions, auto_mirror = _align_connector_buses(
+        positions, auto_mirror, scrambled = _align_connector_buses(
             items, lib, netlist, positions, alias, paper)
     if layout_override:
         positions.update(layout_override)
@@ -996,7 +1009,8 @@ def write_schematic(netlist: dict, bom: dict, output_path, symbols_dir,
         ys = [e[1] for e in ends] + [e[3] for e in ends]
         span = max(max(xs) - min(xs), max(ys) - min(ys))
         label_route = (len(ends) == 2 and not needs_flag
-                       and span >= LABEL_SPAN_MM)
+                       and (span >= LABEL_SPAN_MM
+                            or any(r in scrambled for r, _ in ok)))
 
         net_jobs.append({"key": len(net_jobs), "name": name, "ends": ends,
                          "flag": None, "needs_flag": needs_flag,
