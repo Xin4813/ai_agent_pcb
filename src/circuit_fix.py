@@ -1291,8 +1291,8 @@ def _fix_led(items, ops, lib, fixes):
     _fix_led_gpio_no_resistor(items, ops, lib, fixes)
     _fix_led_cathode_resistor_to_gpio(items, ops, lib, fixes)
     _fix_led_gpio_pullup_always_on(items, ops, lib, fixes)
-    _fix_floating_led_gpio(items, ops, lib, fixes)
     _fix_led_dead_loop(items, ops, lib, fixes)
+    _fix_floating_led_gpio(items, ops, lib, fixes)
 
 
 def _fix_led_dead_loop(items, ops, lib, fixes):
@@ -1334,20 +1334,23 @@ def _fix_led_dead_loop(items, ops, lib, fixes):
     def is_res(ref):
         return by_ref.get(ref, {}).get("symbol", "").lower().startswith("device:r")
 
-    # 找主电源网：按引脚语义（芯片 VCC/VDD 脚、稳压器 VO 脚），网名仅兜底。
-    # 不能只靠 _SUPPLY_RE 匹配网名——LLM 会把电源网命名成 PWR_5V 之类，
-    # 换名后网名判据失效（曾导致换名验证里规则整个跳过）。
-    supply = None
-    for net in ops.nets:
-        if has_gnd_pin(net["name"]):
-            continue
-        for pin in ops.members(net["name"]):
-            r, _, num = pin.partition(":")
-            if pin_sem(r, num) in ("VCC", "VDD", "VDDA", "VIN", "VI", "VBUS"):
-                supply = net["name"]
+    # 找主电源网：优先用 3.3V 稳压器输出（板载芯片/指示灯的常规供电域），
+    # 其次按引脚语义（VCC/VDD/VI/VBUS），网名仅兜底。不能只靠 _SUPPLY_RE，
+    # LLM 会把电源网命名成 PWR_5V 之类导致判据失效；也不能先撞到未稳压
+    # 5V 输入网就把 3.3V 板卡的灯挂上去。
+    v33_rails = sorted(_v33_rail_nets(ops, items, lib))
+    supply = v33_rails[0] if v33_rails else None
+    if supply is None:
+        for net in ops.nets:
+            if has_gnd_pin(net["name"]):
+                continue
+            for pin in ops.members(net["name"]):
+                r, _, num = pin.partition(":")
+                if pin_sem(r, num) in ("VCC", "VDD", "VDDA", "VIN", "VI", "VBUS"):
+                    supply = net["name"]
+                    break
+            if supply:
                 break
-        if supply:
-            break
     if supply is None:
         for it in items:
             if "regulator" not in it.get("symbol", "").lower():
@@ -1450,7 +1453,17 @@ def _fix_led_dead_loop(items, ops, lib, fixes):
                 f"改接电源：{supply}→{rref}→{led['ref']}→GND")
             continue
 
-        # 情形二：电阻另一端落在「另一颗 LED 的阳极网」，而该网同样走不到
+        # 情形二：电阻另一端是「仅此一脚」的孤立网（LLM 给限流电阻起了
+        # LED2限流 之类网名却没接任何驱动），同样迁到电源；若这是用户灯，
+        # 后面的 _fix_floating_led_gpio 会再把它从电源挪到空闲 GPIO。
+        if on and len(ops.members(on)) == 1:
+            ops.attach(other_pin, supply)
+            fixes.append(
+                f"{led['ref']} 的限流电阻 {rref} 原接孤立网 {on} 使回路无驱动，"
+                f"改接电源：{supply}→{rref}→{led['ref']}→GND")
+            continue
+
+        # 情形三：电阻另一端落在「另一颗 LED 的阳极网」，而该网同样走不到
         # 驱动源——LLM 把两颗灯的限流电阻互相跨接（假电源网名如 LED1_VCC，
         # 但网内无真实电源脚）。把电阻该端迁到电源，两灯共用限流。
         # 严格判据：另一端网里至少有一颗别的 LED 阳极，且整网无驱动源。
