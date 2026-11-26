@@ -610,7 +610,7 @@ def _align_connector_buses(items, lib, netlist, positions, alias, paper):
     # 排针脚的引出端点会落到同一栅格列、把相邻的不同网络短接（ERC
     # multiple_net_names）。实测需 ≥ 芯片引脚右缘 + 25mm。
     right_edge = ax + max((p[0] for p in pins_of[anchor].values()), default=0)
-    bus_x = _snap(right_edge + 25.4)
+    bus_x = _snap(right_edge + 38.1)
 
     # 每个排针：镜像后引脚相对 y 不变（_pin_abs 镜像只翻 x），
     # 目标中心 y 取「芯片脚绝对 y - 引脚局部 y」的中位数，使各脚尽量水平对齐。
@@ -1218,26 +1218,55 @@ def write_schematic(netlist: dict, bom: dict, output_path, symbols_dir,
     #  任何网络的引脚 stub（hard），那么同名标签只是把本可直连的线人为截断，
     #  视觉上就是一处「没必要断开」。这种情况恢复实线直连。真正要跨过排针、
     #  芯片或其它 stub 的仍保留标签，保持原规则防断线的初衷。
-    def _straight_clear(job):
-        if len(job["ends"]) != 2 or job["span"] < LABEL_SPAN_MM:
-            return False
-        a = _to_grid(job["ends"][0][2], job["ends"][0][3])   # stub 末端
-        b = _to_grid(job["ends"][1][2], job["ends"][1][3])
-        if a[0] != b[0] and a[1] != b[1]:
-            return False                                     # 不同轴 → 走标签
-        for c in _cells_between(a, b)[1:-1]:                # 中间段，不含两端
+    def _link_clear(a, b):
+        """两栅格点连成的水平/垂直段，除两端外是否无障碍（元件本体/异网 stub）。"""
+        for c in _cells_between(a, b)[1:-1]:
             if c in blocked or c in hard:
                 return False
         return True
 
-    for _job in net_jobs:
-        if _job["label_route"] and _straight_clear(_job):
-            _job["label_route"] = False
-            _job["direct"] = True     # 同轴无阻挡：跳过寻路，直接画直线
+    def _straight_clear(job, key):
+        """返回可用的直连路径（栅格点列表），不可用返回 None。
 
-    def _commit(key, path):
-        path = _shorten_path(path, blocked, soft, hard, key,
-                             edge_owner, vertex_owner)
+        同轴两端画直线；不同轴（典型：芯片脚顺序与排针脚顺序相反，如
+        ATmega 的 PB0~PB5 接到镜像排针时 y 上下颠倒）先试无阻挡 L 型折线，
+        再退到 A* 在密集引脚间找一条真实空隙路径。两种都要求不穿过元件
+        本体/异网 stub；找不到才保留同名标签，维持旧的防断线策略。
+        """
+        if len(job["ends"]) != 2 or job["span"] < LABEL_SPAN_MM:
+            return None
+        a = _to_grid(job["ends"][0][2], job["ends"][0][3])   # stub 末端
+        b = _to_grid(job["ends"][1][2], job["ends"][1][3])
+        if a[0] == b[0] or a[1] == b[1]:                     # 同轴 → 直线
+            return [a, b] if _link_clear(a, b) else None
+        # 不同轴 → 先试两条 L 型折线（先竖后横 / 先横后竖）
+        for e in ((b[0], a[1]), (a[0], b[1])):
+            if e == a or e == b:
+                continue
+            if not (_link_clear(a, e) and _link_clear(e, b)):
+                continue
+            if e in blocked or e in hard:
+                continue
+            return [a, e, b]
+        # L 型被密集引脚 stub 挡住 → 用 A* 在空隙里找路径，再压成折线。
+        # 端点集合 {a,b}：路径只在这两点落脚，不会误接相邻 stub。
+        p = _route_path(a, b, blocked, soft, hard, key, nx, ny,
+                        {a, b}, edge_owner, vertex_owner)
+        if p and _compress_segments(p):
+            return p
+        return None
+
+    for _job in net_jobs:
+        _path = _straight_clear(_job, _job["key"]) if _job["label_route"] else None
+        if _path is not None:
+            _job["label_route"] = False
+            _job["direct"] = True     # 无阻挡：跳过寻路，直接画直线/折线
+            _job["direct_path"] = _path
+
+    def _commit(key, path, fixed=False):
+        if not fixed:
+            path = _shorten_path(path, blocked, soft, hard, key,
+                                 edge_owner, vertex_owner)
         for (x1, y1), (x2, y2) in _compress_segments(path):
             if (x1, y1) != (x2, y2):
                 ga, gb = _to_grid(x1, y1), _to_grid(x2, y2)
@@ -1348,12 +1377,12 @@ def write_schematic(netlist: dict, bom: dict, output_path, symbols_dir,
         if job["flag"]:
             pts.append(_to_grid(job["flag"][0], job["flag"][1]))
         if job.get("direct"):
-            # 同轴无阻挡：两端 stub 末端直接连一条直线。不走 _route_path，
-            # 因为端点标签已作为 soft 占位，寻路的 cross_penalty 会把直线
-            # 逼得折一格。_commit 对两点路径原样保留并登记 soft/edge/vertex，
-            # 后续网络会绕开这条直线，不会引入新交叉。
+            # 无阻挡直连（同轴直线或不同轴的 L 型折线）：两端 stub 末端直接连。
+            # 不走 _route_path，因为端点标签已作为 soft 占位，寻路的
+            # cross_penalty 会把直线逼得折一格。_commit 对给定路径原样保留并
+            # 登记 soft/edge/vertex，后续网络会绕开它，不会引入新交叉。
             job["touched"].update((0, 1))
-            _commit(key, pts[:2])
+            _commit(key, job.get("direct_path", pts[:2]), fixed=True)
         else:
             _mst_route(key, job, pts)
 
