@@ -1687,9 +1687,13 @@ def write_schematic(netlist: dict, bom: dict, output_path, symbols_dir,
         touched = sorted(job["touched"])
         primary = touched[0] if touched else 0
         for i, (ax, ay, ex, ey, odx, ody) in enumerate(job["ends"]):
-            # 通用线头消除：如果这条引出线没有被任何走线接入，而本网的
-            # 标签又挂在别的端点上，这截短线就是悬空「线头」——不画。
-            if touched and i not in touched:
+            # 通用线头消除：未 touch 且本网没有给它挂标签的端点，这截短线
+            # 就是悬空「线头」——不画。反之，走线走不通时会在该端点挂同名
+            # 标签兜底（见 _mst_route「走不通时仍保留网络标签兜底」），此时
+            # 必须把 stub 一起画出，否则标签锚点落在空处、ERC 报 label_dangling
+            # / 引脚未连接。旧版只按 touched 过滤，与标签循环（未 touch 端点
+            # 仍画标签）不一致，导致三端网的某个未接入端点只剩悬空标签。
+            if touched and i not in touched and (key, i) not in final_label_plan:
                 continue
             tex, tey = stub_trim.get((key, i), (ex, ey))
             # 标签避让可能把锚点移到 stub 外侧：把引出线同步延长到新锚点，
