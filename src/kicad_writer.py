@@ -637,7 +637,15 @@ def _align_connector_buses(items, lib, netlist, positions, alias, paper):
         seq = [pairs[k] for k in sorted(pairs)]
         dirs = [(b > a) - (b < a) for a, b in zip(seq, seq[1:])]
         reversals = sum(1 for a, b in zip(dirs, dirs[1:]) if a != b)
-        if targets[-1] - targets[0] > 2.54 * 3 and reversals >= 2:
+        # 另一种混合排针：信号脚号在排针上不连续（中间夹着别的网，如
+        # ICSP 的 1/3/4=MISO/MOSI/SCK、2=VCC、5=RESET、6=GND）。这种映射
+        # 可以单调（无折返），强行对齐仍会让 A* 在密脚间画阶梯。用「小排针
+        # （<=6 脚）且信号脚号内部有空档」识别：能命中 ICSP 这类 6 脚混合
+        # 排针，又不误伤 16/20 脚大排针的个别缺脚（那是另一类布局）。
+        used_pins = sorted(pairs)
+        internal_gap = any(b - a > 1 for a, b in zip(used_pins, used_pins[1:]))
+        small_mixed = len(pins_of[ref]) <= 6 and internal_gap
+        if targets[-1] - targets[0] > 2.54 * 3 and (reversals >= 2 or small_mixed):
             scrambled.add(ref)
         cy = _snap(targets[len(targets) // 2])
         ys = [cy - cpins[p][1] for p in pairs if p in cpins]
