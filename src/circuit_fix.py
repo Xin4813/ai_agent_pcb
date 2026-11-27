@@ -3431,6 +3431,114 @@ def _fix_swd_breakout(items, ops, lib, fixes: list[str]) -> None:
                  f"（原 {swdio['name']}/{swclk['name']} 只挂 MCU 单脚，调试器接不上）")
 
 
+def _ensure_usb_uart_bridge(items, ops, lib, fixes: list[str]) -> None:
+    """USB 口 D± 直接落到 MCU 的 TXD/RXD 且板上没有 USB-UART 芯片时补 CH340G。
+
+    ERC/视觉/安全都只看「脚是否接上网」，Micro-B 的 D−/D+ 直接接 UART 是
+    单端串口 ↔ 差分 USB 的硬 functional 错误：烧录/通信完全不成立。判据
+    必须同时满足：①存在 5 针 USB 连接器；②它的 D± 两条网里各有一个 MCU
+    UART 脚；③板上没有 UART 特征符号。修法只做结构性重连：把 D± 改挂
+    新建的 USB_D±，插入 CH340G 的 UD±，TXD/RXD 交叉回原 MCU 串口网；
+    XI/XO、V3 退耦交给后续 _fix_usb 用同一规则补齐，不在此重复造件。
+    """
+    if lib is None or any(_looks_uart_symbol(it, lib) for it in items):
+        return
+    usb = next((it for it in items
+                if any(k in str(it.get("symbol", "")).lower()
+                       for k in ("conn_01x05", "usb_micro", "usb_type"))), None)
+    if not usb:
+        return
+    d_p, d_m = _usb_data_pins(usb, lib)
+    dp_pin, dm_pin = f"{usb['ref']}:{d_p}", f"{usb['ref']}:{d_m}"
+    dp_net, dm_net = ops.name(dp_pin), ops.name(dm_pin)
+    if not dp_net or not dm_net or dp_net == dm_net:
+        return
+
+    tx_nets: set[str] = set()
+    rx_nets: set[str] = set()
+    for it in items:
+        if not _is_mcu_item(it):
+            continue
+        try:
+            pin_names = lib.pin_names(it.get("symbol", ""))
+        except Exception:
+            continue
+        for num, pname in pin_names.items():
+            net = ops.name(f"{it['ref']}:{num}")
+            if not net:
+                continue
+            role = _mcu_uart_role(str(pname), net)
+            if role == "TX":
+                tx_nets.add(net)
+            elif role == "RX":
+                rx_nets.add(net)
+    if not tx_nets or not rx_nets:
+        return
+    if not ((dm_net in tx_nets and dp_net in rx_nets)
+            or (dm_net in rx_nets and dp_net in tx_nets)):
+        return
+    tx_net = dm_net if dm_net in tx_nets else dp_net
+    rx_net = dp_net if dp_net in rx_nets else dm_net
+
+    vbus = ops.name(f"{usb['ref']}:1") or _usb_vbus_net(ops, items, lib)
+    gnd = _gnd_net(ops)
+    if not vbus or not gnd:
+        return
+    ur = _add_ref(items, "U")
+    uart = {"ref": ur, "name": "USB 转串口", "value": "CH340G", "qty": 1,
+            "symbol": "Interface_USB:CH340G", "footprint": "",
+            "desc": "USB 转 TTL 串口，负责 ESP32 下载与通信"}
+    items.append(uart)
+
+    usb_dp = _unique_net_name(ops, "USB_D+")
+    usb_dm = _unique_net_name(ops, "USB_D-")
+    ops.attach(dp_pin, usb_dp)
+    ops.attach(dm_pin, usb_dm)
+    ud_p = next(iter(_p(uart, lib, "UD+") or _p(uart, lib, "D+")), "5")
+    ud_m = next(iter(_p(uart, lib, "UD-") or _p(uart, lib, "D-")), "6")
+    txd = next(iter(_p(uart, lib, "TXD") or _p(uart, lib, "TX")), "2")
+    rxd = next(iter(_p(uart, lib, "RXD") or _p(uart, lib, "RX")), "3")
+    vcc = next(iter(_p(uart, lib, "VCC")), "16")
+    gndp = next(iter(_p(uart, lib, "GND")), "1")
+    v3p = next(iter(_p(uart, lib, "V3")), "4")
+    ops.attach(f"{ur}:{ud_p}", usb_dp)
+    ops.attach(f"{ur}:{ud_m}", usb_dm)
+    # UART 的发送必须落到 MCU 的 RX 网，接收落到 TX 网（交叉），否则收发都不通。
+    ops.attach(f"{ur}:{txd}", rx_net)
+    ops.attach(f"{ur}:{rxd}", tx_net)
+    ops.attach(f"{ur}:{vcc}", vbus)
+    ops.attach(f"{ur}:{gndp}", gnd)
+    ops.attach(f"{ur}:{v3p}", _unique_net_name(ops, f"{ur}_V3"))
+    fixes.append(
+        f"USB 口 {usb['ref']} 的 D± 原直连 MCU 串口（{dm_net}/{dp_net}），"
+        f"已补 {ur}(CH340G)：D±→UD±，TXD→{rx_net}、RXD→{tx_net}")
+
+
+def _sync_connector_value_to_symbol(items, lib, fixes: list[str]) -> None:
+    """排针 BOM 标称 2xN 但符号实际是 1xN 时，按符号纠正标称。"""
+    if lib is None:
+        return
+    for it in items:
+        sym = str(it.get("symbol", ""))
+        sm = re.search(r"Conn_01x(\d+)_Pin", sym, re.I)
+        if not sm:
+            continue
+        n = int(sm.group(1))
+        value = str(it.get("value", "")).strip()
+        vm = re.fullmatch(r"(\d+)\s*[xX]\s*(\d+)", value)
+        if not vm:
+            continue
+        rows, cols = int(vm.group(1)), int(vm.group(2))
+        if rows * cols == n:  # 标称脚数与符号一致，不动
+            continue
+        new = f"1x{n}"
+        it["value"] = new
+        desc = str(it.get("desc", ""))
+        if value and value in desc:
+            it["desc"] = desc.replace(value, new)
+        fixes.append(f"{it['ref']} 标称 {value} 与符号 {n} 脚不符，已改为 {new}")
+
+
 def fix_topology(bom: dict, netlist: dict, symbol_lib=None) -> list[str]:
     """就地修正可检测到的拓扑错误，返回修正说明列表。"""
     items = bom.get("items", [])
@@ -3462,6 +3570,7 @@ def fix_topology(bom: dict, netlist: dict, symbol_lib=None) -> list[str]:
     _fix_mcu_pins(items, ops, symbol_lib, fixes)
     _fix_swd_clock(items, ops, symbol_lib, fixes)
     _fix_uart_symbol(items, ops, symbol_lib, fixes)   # 先纠正型号/符号错配，再让 _fix_usb 补晶振
+    _ensure_usb_uart_bridge(items, ops, symbol_lib, fixes)  # USB D± 直连 MCU 串口→补 CH340G
     _split_shared_crystal(items, ops, symbol_lib, fixes)  # 两芯片共用晶振→拆分，MCU 改用悬空的那颗
     _fix_usb(items, ops, symbol_lib, fixes)
     _fix_uart_missing_link(items, ops, symbol_lib, fixes)  # TXD/RXD 整对漏接→补到 MCU USART 脚
@@ -3481,6 +3590,7 @@ def fix_topology(bom: dict, netlist: dict, symbol_lib=None) -> list[str]:
     _drop_duplicate_ghost_items(items, ops, fixes)
     _drop_stale_migration_fixes(ops, fixes)
     _sync_footprints(items, symbol_lib, fixes)  # BOM 封装脚数必须与符号一致
+    _sync_connector_value_to_symbol(items, symbol_lib, fixes)  # 2xN 标称 vs 1xN 符号
     _sync_uart_bom_text(items, symbol_lib, fixes)  # 串口芯片的 BOM 文案同步
     validate_netlist(netlist, bom)
     return fixes
